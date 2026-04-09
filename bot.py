@@ -5,7 +5,8 @@ import logging
 import os
 import re
 import socket
-from urllib.parse import parse_qs, unquote, urlparse
+import uuid
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import httpx
 from dotenv import load_dotenv
@@ -31,8 +32,26 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 IPWHO_ACCESS_KEY = os.getenv("IPWHO_ACCESS_KEY", "")
 IPWHO_BASE_URL = "https://ipwho.is"
 
-# Max servers to geo-lookup in a subscription (to avoid rate limiting)
 SUB_GEO_LIMIT = 10
+
+
+def get_hwid() -> str:
+    """Return a stable machine identifier to pass with subscription requests."""
+    # 1. Explicit override via env
+    if val := os.getenv("HWID"):
+        return val
+    # 2. Linux machine-id
+    try:
+        with open("/etc/machine-id") as f:
+            return f.read().strip()
+    except OSError:
+        pass
+    # 3. MAC-address based fallback (cross-platform)
+    return uuid.UUID(int=uuid.getnode()).hex
+
+
+HWID = get_hwid()
+logger.info("HWID: %s", HWID)
 
 # ---------------------------------------------------------------------------
 # Patterns
@@ -116,29 +135,15 @@ def format_ip_info(data: dict, header: str | None = None) -> str:
     ip = data.get("ip", "")
     asn = conn.get("asn", "N/A")
 
-    title = header if header else f"{flag} *IP: {ip}*"
+    title = header if header else f"{flag} *{ip}*"
 
     return "\n".join([
         title,
-        f"Type: `{data.get('type', 'N/A')}`",
+        f"`{data.get('type', 'N/A')}` · {data.get('country', 'N/A')}, {data.get('city', 'N/A')}",
         "",
-        "*Location*",
-        f"Country: {data.get('country', 'N/A')} ({data.get('country_code', '')}) {flag}",
-        f"Region: {data.get('region', 'N/A')} ({data.get('region_code', '')})",
-        f"City: {data.get('city', 'N/A')}",
-        f"Postal: {data.get('postal', 'N/A')}",
-        f"Coordinates: {data.get('latitude')}, {data.get('longitude')}",
-        f"EU: {'Yes' if data.get('is_eu') else 'No'}",
-        "",
-        "*Network*",
-        f"ASN: AS{asn}",
-        f"ISP: {conn.get('isp', 'N/A')}",
-        f"Org: {conn.get('org', 'N/A')}",
-        f"Domain: {conn.get('domain', 'N/A')}",
-        "",
-        "*Timezone*",
-        f"Zone: {tz.get('id', 'N/A')} ({tz.get('utc', 'N/A')})",
-        f"DST: {'Yes' if tz.get('is_dst') else 'No'}",
+        f"org: AS{asn} {conn.get('org', conn.get('isp', 'N/A'))}",
+        f"hostname: {conn.get('domain', 'N/A')}",
+        f"timezone: {tz.get('id', 'N/A')}",
     ])
 
 
@@ -286,14 +291,10 @@ def format_proxy_detail(v: dict, geo: dict, ip: str) -> str:
         lines += [
             "",
             f"*Geolocation {flag}*",
-            f"IP: `{ip}`",
-            f"Country: {geo.get('country', 'N/A')} ({geo.get('country_code', '')})",
-            f"Region: {geo.get('region', 'N/A')}",
-            f"City: {geo.get('city', 'N/A')}",
-            f"ISP: {conn.get('isp', 'N/A')}",
-            f"ASN: AS{asn}",
-            f"Org: {conn.get('org', 'N/A')}",
-            f"Timezone: {tz.get('id', 'N/A')} ({tz.get('utc', 'N/A')})",
+            f"`{ip}` · {geo.get('country', 'N/A')}, {geo.get('city', 'N/A')}",
+            f"org: AS{asn} {conn.get('org', conn.get('isp', 'N/A'))}",
+            f"hostname: {conn.get('domain', 'N/A')}",
+            f"timezone: {tz.get('id', 'N/A')}",
         ]
     else:
         lines += ["", f"_Geolocation unavailable: {geo.get('message', 'unknown error')}_"]
@@ -304,11 +305,20 @@ def format_proxy_detail(v: dict, geo: dict, ip: str) -> str:
 # ---------------------------------------------------------------------------
 # Subscription fetcher & parser
 # ---------------------------------------------------------------------------
+def _inject_hwid(url: str) -> str:
+    """Append hwid query parameter to a subscription URL."""
+    parsed = urlparse(url)
+    sep = "&" if parsed.query else ""
+    new_query = parsed.query + sep + urlencode({"hwid": HWID})
+    return urlunparse(parsed._replace(query=new_query))
+
+
 async def fetch_subscription_lines(url: str) -> list[str]:
-    """Fetch a subscription URL and return a list of proxy URI lines."""
-    logger.info("Fetching subscription: %s", url)
+    """Fetch a subscription URL (with HWID) and return a list of proxy URI lines."""
+    url_with_hwid = _inject_hwid(url)
+    logger.info("Fetching subscription: %s", url_with_hwid)
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        response = await client.get(url)
+        response = await client.get(url_with_hwid)
         response.raise_for_status()
         raw = response.text.strip()
 
