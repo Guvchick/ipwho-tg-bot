@@ -71,13 +71,30 @@ PROXY_PREFIXES = ("vless://", "vmess://", "trojan://", "ss://")
 
 
 # ---------------------------------------------------------------------------
+# HTTP request/response logging hooks
+# ---------------------------------------------------------------------------
+async def _log_request(request: httpx.Request) -> None:
+    logger.info("→ %s %s", request.method, request.url)
+
+
+async def _log_response(response: httpx.Response) -> None:
+    logger.info("← %s %s %s", response.status_code, response.request.method, response.request.url)
+
+
+def _make_client(**kwargs) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        event_hooks={"request": [_log_request], "response": [_log_response]},
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
 # ipwho.is API
 # ---------------------------------------------------------------------------
 async def fetch_ip_info(ip: str) -> dict:
     url = f"{IPWHO_BASE_URL}/{ip}"
     params = {"access_key": IPWHO_ACCESS_KEY} if IPWHO_ACCESS_KEY else {}
-    logger.info("API request → %s", ip)
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with _make_client(timeout=10) as client:
         response = await client.get(url, params=params)
         if response.status_code == 404:
             return response.json()
@@ -139,11 +156,17 @@ def format_ip_info(data: dict, header: str | None = None) -> str:
 
     return "\n".join([
         title,
-        f"`{data.get('type', 'N/A')}` · {data.get('country', 'N/A')}, {data.get('city', 'N/A')}",
         "",
+        "*ipinfo*",
         f"org: AS{asn} {conn.get('org', conn.get('isp', 'N/A'))}",
         f"hostname: {conn.get('domain', 'N/A')}",
         f"timezone: {tz.get('id', 'N/A')}",
+        "",
+        "*MaxMind*",
+        f"country: {data.get('country', 'N/A')} ({data.get('country_code', '')}) {flag}",
+        f"city: {data.get('region', 'N/A')}, {data.get('city', 'N/A')}",
+        f"coordinates: {data.get('latitude')}, {data.get('longitude')}",
+        f"type: `{data.get('type', 'N/A')}`",
     ])
 
 
@@ -290,11 +313,16 @@ def format_proxy_detail(v: dict, geo: dict, ip: str) -> str:
     if geo.get("success"):
         lines += [
             "",
-            f"*Geolocation {flag}*",
-            f"`{ip}` · {geo.get('country', 'N/A')}, {geo.get('city', 'N/A')}",
+            f"*ipinfo* {flag}",
+            f"ip: `{ip}`",
             f"org: AS{asn} {conn.get('org', conn.get('isp', 'N/A'))}",
             f"hostname: {conn.get('domain', 'N/A')}",
             f"timezone: {tz.get('id', 'N/A')}",
+            "",
+            "*MaxMind*",
+            f"country: {geo.get('country', 'N/A')} ({geo.get('country_code', '')})",
+            f"city: {geo.get('region', 'N/A')}, {geo.get('city', 'N/A')}",
+            f"coordinates: {geo.get('latitude')}, {geo.get('longitude')}",
         ]
     else:
         lines += ["", f"_Geolocation unavailable: {geo.get('message', 'unknown error')}_"]
@@ -316,9 +344,14 @@ def _inject_hwid(url: str) -> str:
 async def fetch_subscription_lines(url: str) -> list[str]:
     """Fetch a subscription URL (with HWID) and return a list of proxy URI lines."""
     url_with_hwid = _inject_hwid(url)
-    logger.info("Fetching subscription: %s", url_with_hwid)
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        response = await client.get(url_with_hwid)
+    logger.info("Fetching subscription: %s  |  HWID: %s", url_with_hwid, HWID)
+    headers = {
+        "User-Agent": f"ClashForAndroid/2.5.12 (hwid={HWID})",
+        "X-HWID": HWID,
+        "Device-Id": HWID,
+    }
+    async with _make_client(timeout=20, follow_redirects=True) as client:
+        response = await client.get(url_with_hwid, headers=headers)
         response.raise_for_status()
         raw = response.text.strip()
 
