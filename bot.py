@@ -8,6 +8,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+IPWHO_ACCESS_KEY = os.getenv("IPWHO_ACCESS_KEY", "")
 IPWHO_BASE_URL = "https://ipwho.is"
 
 IP_PATTERN = re.compile(
@@ -21,9 +22,13 @@ IP_PATTERN = re.compile(
 
 async def fetch_ip_info(ip: str) -> dict:
     url = f"{IPWHO_BASE_URL}/{ip}"
+    params = {"access_key": IPWHO_ACCESS_KEY} if IPWHO_ACCESS_KEY else {}
     async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.get(url)
-        response.raise_for_status()
+        response = await client.get(url, params=params)
+        if response.status_code == 404:
+            return response.json()
+        if response.status_code != 200:
+            response.raise_for_status()
         return response.json()
 
 
