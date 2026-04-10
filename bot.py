@@ -367,20 +367,42 @@ async def fetch_subscription_lines(url: str) -> tuple[list[str], dict]:
         hwid_active, hwid_not_supported, hwid_max_reached, hwid_limit,
     )
 
-    # Try base64 decode first
-    try:
-        decoded = base64.b64decode(raw + "==").decode("utf-8")
-        lines = [l.strip() for l in decoded.splitlines() if l.strip()]
-        if any(l.lower().startswith(PROXY_PREFIXES) for l in lines):
-            logger.info("Subscription decoded from base64: %d lines", len(lines))
-            return lines, resp_headers
-    except Exception:
-        pass
+    def _try_b64(data: str) -> list[str] | None:
+        """Try both standard and URL-safe base64 with correct padding."""
+        for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                padded = data + "=" * (-len(data) % 4)
+                decoded = decoder(padded.encode()).decode("utf-8")
+                lines = [l.strip() for l in decoded.splitlines() if l.strip()]
+                if any(l.lower().startswith(PROXY_PREFIXES) for l in lines):
+                    return lines
+            except Exception:
+                continue
+        return None
 
-    # Fallback: plain text, one URI per line
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    logger.info("Subscription plain text: %d lines", len(lines))
-    return lines, resp_headers
+    # 1. Try decoding the whole body as base64
+    decoded_lines = _try_b64(raw)
+    if decoded_lines:
+        logger.info("Subscription decoded from base64: %d lines", len(decoded_lines))
+        return decoded_lines, resp_headers
+
+    # 2. Plain text — split by lines
+    plain_lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if any(l.lower().startswith(PROXY_PREFIXES) for l in plain_lines):
+        logger.info("Subscription plain text: %d lines", len(plain_lines))
+        return plain_lines, resp_headers
+
+    # 3. Maybe the single line is itself base64 (some panels wrap once more)
+    for line in plain_lines:
+        decoded_lines = _try_b64(line)
+        if decoded_lines:
+            logger.info("Subscription double-encoded base64: %d lines", len(decoded_lines))
+            return decoded_lines, resp_headers
+
+    # 4. Return raw lines as-is and let caller deal with it
+    logger.warning("Subscription: could not detect format, returning %d raw lines  preview=%r",
+                   len(plain_lines), raw[:120])
+    return plain_lines, resp_headers
 
 
 async def geo_for_host(host: str) -> tuple[str, dict]:
