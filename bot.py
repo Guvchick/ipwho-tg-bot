@@ -341,19 +341,38 @@ def _inject_hwid(url: str) -> str:
     return urlunparse(parsed._replace(query=new_query))
 
 
-async def fetch_subscription_lines(url: str) -> list[str]:
-    """Fetch a subscription URL (with HWID) and return a list of proxy URI lines."""
+async def fetch_subscription_lines(url: str) -> tuple[list[str], dict]:
+    """
+    Fetch a subscription URL with HWID headers (Remnawave standard).
+    Returns (lines, response_headers).
+    Registration is automatic — the panel registers the device on first request
+    that includes the x-hwid header, as long as the device limit isn't exceeded.
+    """
     url_with_hwid = _inject_hwid(url)
-    logger.info("Fetching subscription: %s  |  HWID: %s", url_with_hwid, HWID)
+    # Remnawave HWID standard: https://docs.rw/docs/features/hwid-device-limit
     headers = {
-        "User-Agent": f"ClashForAndroid/2.5.12 (hwid={HWID})",
-        "X-HWID": HWID,
-        "Device-Id": HWID,
+        "x-hwid": HWID,
+        "x-device-os": "Linux",
+        "x-ver-os": "6.1",
+        "x-device-model": "Server",
+        "User-Agent": "Happ/1.0",
     }
+    logger.info("Fetching subscription  HWID=%s  url=%s", HWID, url_with_hwid)
     async with _make_client(timeout=20, follow_redirects=True) as client:
         response = await client.get(url_with_hwid, headers=headers)
         response.raise_for_status()
         raw = response.text.strip()
+        resp_headers = dict(response.headers)
+
+    # Log HWID status from response headers
+    hwid_active = resp_headers.get("x-hwid-active", "")
+    hwid_not_supported = resp_headers.get("x-hwid-not-supported", "")
+    hwid_max_reached = resp_headers.get("x-hwid-max-devices-reached", "")
+    hwid_limit = resp_headers.get("x-hwid-limit", "")
+    logger.info(
+        "Subscription response HWID headers: active=%s not_supported=%s max_reached=%s limit=%s",
+        hwid_active, hwid_not_supported, hwid_max_reached, hwid_limit,
+    )
 
     # Try base64 decode first
     try:
@@ -361,14 +380,14 @@ async def fetch_subscription_lines(url: str) -> list[str]:
         lines = [l.strip() for l in decoded.splitlines() if l.strip()]
         if any(l.lower().startswith(PROXY_PREFIXES) for l in lines):
             logger.info("Subscription decoded from base64: %d lines", len(lines))
-            return lines
+            return lines, resp_headers
     except Exception:
         pass
 
     # Fallback: plain text, one URI per line
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
     logger.info("Subscription plain text: %d lines", len(lines))
-    return lines
+    return lines, resp_headers
 
 
 async def geo_for_host(host: str) -> tuple[str, dict]:
@@ -539,7 +558,7 @@ async def subscription_and_reply(update: Update, url: str) -> None:
         parse_mode="Markdown",
     )
     try:
-        lines = await fetch_subscription_lines(url)
+        lines, resp_hdrs = await fetch_subscription_lines(url)
         all_proxies = [p for line in lines if (p := parse_proxy_uri(line)) is not None]
 
         # Separate valid entries from error placeholders
@@ -547,17 +566,24 @@ async def subscription_and_reply(update: Update, url: str) -> None:
         proxies = [p for p in all_proxies if not _is_error_entry(p)]
 
         if error_entries and not proxies:
+            # Determine exact reason from Remnawave response headers
+            if resp_hdrs.get("x-hwid-max-devices-reached") == "true":
+                reason = "Превышен лимит устройств для этой подписки."
+            elif resp_hdrs.get("x-hwid-not-supported") == "true":
+                reason = "Клиент не поддерживает HWID (заголовок x-hwid не принят сервером)."
+            else:
+                reason = "HWID не зарегистрирован или не принят сервером."
+
             names = ", ".join(e["name"] for e in error_entries[:3])
             logger.warning(
-                "Subscription returned only error entries (HWID rejected?): %s  HWID=%s  url=%s",
-                names, HWID, url,
+                "Subscription error entries: %s  reason=%s  HWID=%s  url=%s",
+                names, reason, HWID, url,
             )
             await msg.edit_text(
                 f"Сервер отклонил запрос.\n\n"
+                f"*Причина:* {reason}\n\n"
                 f"Ответ сервера: _{names}_\n\n"
-                f"Возможная причина: HWID не зарегистрирован на сервере.\n"
-                f"Зарегистрируй этот HWID в панели провайдера:\n"
-                f"`{HWID}`",
+                f"HWID этого бота:\n`{HWID}`",
                 parse_mode="Markdown",
             )
             return
