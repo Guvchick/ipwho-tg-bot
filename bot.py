@@ -6,7 +6,7 @@ import os
 import re
 import socket
 import uuid
-from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -32,7 +32,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 IPWHO_ACCESS_KEY = os.getenv("IPWHO_ACCESS_KEY", "")
 IPWHO_BASE_URL = "https://ipwho.is"
 
-SUB_GEO_LIMIT = 10
+# Delay between per-server messages to respect Telegram rate limits
+SUB_MESSAGE_DELAY = 0.4
 
 
 def get_hwid() -> str:
@@ -65,7 +66,8 @@ IP_RE = re.compile(
 )
 DOMAIN_RE = re.compile(r"^(?!-)([a-zA-Z0-9\-]{1,63}\.)+[a-zA-Z]{2,}$")
 VLESS_RE = re.compile(r"vless://\S+", re.IGNORECASE)
-URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+# Match any http/https URL anywhere in the message
+URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 PROXY_PREFIXES = ("vless://", "vmess://", "trojan://", "ss://")
 
@@ -333,14 +335,6 @@ def format_proxy_detail(v: dict, geo: dict, ip: str) -> str:
 # ---------------------------------------------------------------------------
 # Subscription fetcher & parser
 # ---------------------------------------------------------------------------
-def _inject_hwid(url: str) -> str:
-    """Append hwid query parameter to a subscription URL."""
-    parsed = urlparse(url)
-    sep = "&" if parsed.query else ""
-    new_query = parsed.query + sep + urlencode({"hwid": HWID})
-    return urlunparse(parsed._replace(query=new_query))
-
-
 async def fetch_subscription_lines(url: str) -> tuple[list[str], dict]:
     """
     Fetch a subscription URL with HWID headers (Remnawave standard).
@@ -348,7 +342,6 @@ async def fetch_subscription_lines(url: str) -> tuple[list[str], dict]:
     Registration is automatic — the panel registers the device on first request
     that includes the x-hwid header, as long as the device limit isn't exceeded.
     """
-    url_with_hwid = _inject_hwid(url)
     # Remnawave HWID standard: https://docs.rw/docs/features/hwid-device-limit
     headers = {
         "x-hwid": HWID,
@@ -357,9 +350,9 @@ async def fetch_subscription_lines(url: str) -> tuple[list[str], dict]:
         "x-device-model": "Server",
         "User-Agent": "Happ/1.0",
     }
-    logger.info("Fetching subscription  HWID=%s  url=%s", HWID, url_with_hwid)
+    logger.info("Fetching subscription  HWID=%s  url=%s", HWID, url)
     async with _make_client(timeout=20, follow_redirects=True) as client:
-        response = await client.get(url_with_hwid, headers=headers)
+        response = await client.get(url, headers=headers)
         response.raise_for_status()
         raw = response.text.strip()
         resp_headers = dict(response.headers)
@@ -428,10 +421,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     raw = update.message.text.strip()
     user = update.effective_user
 
-    # 1. Subscription URL (http/https, must check before domain)
-    if URL_RE.match(raw):
+    # 1. Subscription URL — search anywhere in the message
+    url_match = URL_RE.search(raw)
+    if url_match:
         logger.info("User %s (%s) → subscription URL", user.id, user.username)
-        await subscription_and_reply(update, raw)
+        await subscription_and_reply(update, url_match.group(0))
         return
 
     # 2. VLESS/VMess/Trojan — search anywhere in the message
@@ -553,10 +547,7 @@ def _is_error_entry(v: dict) -> bool:
 
 
 async def subscription_and_reply(update: Update, url: str) -> None:
-    msg = await update.message.reply_text(
-        f"Загружаю подписку...\n_HWID: `{HWID}`_",
-        parse_mode="Markdown",
-    )
+    msg = await update.message.reply_text("Загружаю подписку...")
     try:
         lines, resp_hdrs = await fetch_subscription_lines(url)
         all_proxies = [p for line in lines if (p := parse_proxy_uri(line)) is not None]
@@ -595,55 +586,43 @@ async def subscription_and_reply(update: Update, url: str) -> None:
             return
 
         total = len(proxies)
-        to_lookup = proxies[:SUB_GEO_LIMIT]
-        logger.info("Subscription: %d valid servers (%d errors filtered), geo-lookup for first %d  HWID=%s",
-                    total, len(error_entries), len(to_lookup), HWID)
+        logger.info("Subscription: %d valid servers (%d errors filtered)  HWID=%s  url=%s",
+                    total, len(error_entries), HWID, url)
 
+        # Update status message → header
         await msg.edit_text(
-            f"Найдено серверов: *{total}*. Получаю геолокацию для первых {len(to_lookup)}...",
+            f"📋 *Подписка — {total} серверов*\nПолучаю геолокацию...",
             parse_mode="Markdown",
         )
 
-        # Concurrent geo lookups
-        tasks = [geo_for_host(p["host"]) for p in to_lookup]
-        results = await asyncio.gather(*tasks)
+        # Process and send each server as a separate message
+        for i, v in enumerate(proxies, start=1):
+            try:
+                ip, geo = await geo_for_host(v["host"])
+                asn = geo.get("connection", {}).get("asn", "N/A") if geo.get("success") else "N/A"
+                text = format_proxy_detail(v, geo, ip)
+                # Prepend index
+                text = f"*{i}/{total}*\n\n" + text
+                await update.message.reply_text(
+                    text,
+                    parse_mode="Markdown",
+                    reply_markup=make_keyboard(ip, asn),
+                )
+                logger.info("Sub server %d/%d: %s ip=%s country=%s",
+                            i, total, v["host"], ip, geo.get("country"))
+            except Exception as exc:
+                logger.warning("Sub server %d/%d (%s) failed: %s", i, total, v["host"], exc)
+                await update.message.reply_text(
+                    f"*{i}/{total}* — `{v['host']}:{v['port']}`\n_Ошибка: {exc}_",
+                    parse_mode="Markdown",
+                )
 
-        # Build output
-        lines_out = [f"📋 *Подписка — {total} серверов*\n"]
-        for i, (v, (ip, geo)) in enumerate(zip(to_lookup, results), start=1):
-            flag = geo.get("flag", {}).get("emoji", "") if geo.get("success") else ""
-            conn = geo.get("connection", {}) if geo.get("success") else {}
-            asn = conn.get("asn", "N/A")
-            country = geo.get("country", "?") if geo.get("success") else "—"
-            isp = conn.get("isp", "—") if geo.get("success") else "—"
-            proto = v.get("proto", "?").upper()
+            # Respect Telegram rate limit between messages
+            if i < total:
+                await asyncio.sleep(SUB_MESSAGE_DELAY)
 
-            lines_out.append(
-                f"{i}\\. {flag} *{v['name']}* `[{proto}]`\n"
-                f"   `{v['host']}:{v['port']}` · {country} · {isp}\n"
-                f"   {lookup_links(ip, asn)}"
-            )
-
-        if total > SUB_GEO_LIMIT:
-            lines_out.append(f"\n_...и ещё {total - SUB_GEO_LIMIT} серверов без геолокации_")
-
-        text = "\n\n".join(lines_out)
-
-        # Telegram limit is 4096 chars; split if needed
-        if len(text) <= 4096:
-            await msg.edit_text(text, parse_mode="Markdown")
-        else:
-            await msg.delete()
-            chunk = ""
-            for block in lines_out:
-                if len(chunk) + len(block) + 2 > 4096:
-                    await update.message.reply_text(chunk.strip(), parse_mode="Markdown")
-                    chunk = block + "\n\n"
-                else:
-                    chunk += block + "\n\n"
-            if chunk.strip():
-                await update.message.reply_text(chunk.strip(), parse_mode="Markdown")
-
+        # Update header to final state
+        await msg.edit_text(f"📋 *Подписка — {total} серверов* ✓", parse_mode="Markdown")
         logger.info("Subscription OK: %d servers, url=%s", total, url)
 
     except httpx.HTTPStatusError as exc:
