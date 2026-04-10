@@ -6,7 +6,7 @@ import os
 import re
 import socket
 import uuid
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -70,6 +70,20 @@ VLESS_RE = re.compile(r"vless://\S+", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 PROXY_PREFIXES = ("vless://", "vmess://", "trojan://", "ss://")
+
+# User-Agents tried in order when fetching a subscription.
+# If the first returns an unrecognisable body, the next is tried automatically.
+SUBSCRIPTION_UA_CHAIN = [
+    # Happ — reference Remnawave HWID client
+    "Happ/1.0",
+    # v2RayTun — another HWID-aware client
+    "v2RayTun/5.0",
+    # Clash-based clients (very common, some panels serve Clash YAML to these)
+    "ClashForAndroid/2.5.12",
+    "ClashMeta/1.18.0",
+    # Generic bare request — some panels serve base64 only to unknown UA
+    "python-httpx/0.27.0",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -333,76 +347,228 @@ def format_proxy_detail(v: dict, geo: dict, ip: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Subscription fetcher & parser
+# Subscription body parsers
+# ---------------------------------------------------------------------------
+def _try_b64(data: str) -> list[str] | None:
+    """Try standard and URL-safe base64 decode; return proxy lines or None."""
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            padded = data + "=" * (-len(data) % 4)
+            decoded = decoder(padded.encode()).decode("utf-8")
+            lines = [l.strip() for l in decoded.splitlines() if l.strip()]
+            if any(l.lower().startswith(PROXY_PREFIXES) for l in lines):
+                return lines
+        except Exception:
+            continue
+    return None
+
+
+def _parse_xray_json(raw: str) -> list[str] | None:
+    """
+    Parse Xray/sing-box JSON subscription formats.
+    Supports:
+      - {"outbounds": [...]}  — Xray full config
+      - [{"protocol": ..., ...}, ...]  — array of outbound objects
+      - newline-delimited JSON objects (one per line)
+    Returns a list of proxy:// URI strings, or None if not Xray JSON.
+    """
+    def outbound_to_uri(ob: dict) -> str | None:
+        proto = ob.get("protocol", ob.get("type", "")).lower()
+        tag = ob.get("tag", ob.get("name", "N/A"))
+
+        if proto == "vless":
+            settings = ob.get("settings", {})
+            vnext = settings.get("vnext", [{}])[0]
+            address = vnext.get("address", "")
+            port = vnext.get("port", 0)
+            user = vnext.get("users", [{}])[0]
+            uid = user.get("id", "")
+            flow = user.get("flow", "")
+            ss = ob.get("streamSettings", {})
+            network = ss.get("network", "tcp")
+            security = ss.get("security", "none")
+            reality = ss.get("realitySettings", {})
+            tls = ss.get("tlsSettings", {})
+            sni = reality.get("serverName", tls.get("serverName", ""))
+            fp = reality.get("fingerprint", "")
+            pbk = reality.get("publicKey", "")
+            sid = reality.get("shortId", "")
+            params = {"security": security, "type": network, "flow": flow,
+                      "sni": sni, "fp": fp, "pbk": pbk, "sid": sid}
+            qs = "&".join(f"{k}={v}" for k, v in params.items() if v)
+            name = unquote(tag)
+            return f"vless://{uid}@{address}:{port}?{qs}#{quote(name)}"
+
+        if proto in ("vmess",):
+            # Xray vmess is encoded separately; reconstruct standard vmess URI
+            settings = ob.get("settings", {})
+            vnext = settings.get("vnext", [{}])[0]
+            address = vnext.get("address", "")
+            port = vnext.get("port", 0)
+            user = vnext.get("users", [{}])[0]
+            uid = user.get("id", "")
+            ss = ob.get("streamSettings", {})
+            network = ss.get("network", "tcp")
+            security = ss.get("security", "none")
+            tls_s = ss.get("tlsSettings", {})
+            sni = tls_s.get("serverName", "")
+            ws = ss.get("wsSettings", {})
+            path = ws.get("path", "")
+            host = ws.get("headers", {}).get("Host", "")
+            vmess_obj = {
+                "v": "2", "ps": tag, "add": address, "port": str(port),
+                "id": uid, "net": network, "tls": security, "sni": sni,
+                "path": path, "host": host, "type": "none",
+            }
+            b64 = base64.b64encode(json.dumps(vmess_obj).encode()).decode()
+            return f"vmess://{b64}"
+
+        if proto == "trojan":
+            settings = ob.get("settings", {})
+            servers = settings.get("servers", [{}])[0]
+            address = servers.get("address", "")
+            port = servers.get("port", 0)
+            password = servers.get("password", "")
+            ss = ob.get("streamSettings", {})
+            network = ss.get("network", "tcp")
+            security = ss.get("security", "none")
+            tls_s = ss.get("tlsSettings", {})
+            sni = tls_s.get("serverName", "")
+            params = {"security": security, "type": network, "sni": sni}
+            qs = "&".join(f"{k}={v}" for k, v in params.items() if v)
+            return f"trojan://{password}@{address}:{port}?{qs}#{quote(tag)}"
+
+        return None
+
+    # Try full JSON object / array
+    try:
+        data = json.loads(raw)
+        outbounds = []
+        if isinstance(data, dict):
+            outbounds = data.get("outbounds", [])
+        elif isinstance(data, list):
+            outbounds = data
+
+        # Filter out non-proxy outbounds (freedom, blackhole, dns, etc.)
+        skip = {"freedom", "blackhole", "dns", "loopback", "direct"}
+        uris = []
+        for ob in outbounds:
+            if ob.get("protocol", ob.get("type", "")).lower() in skip:
+                continue
+            uri = outbound_to_uri(ob)
+            if uri:
+                uris.append(uri)
+        if uris:
+            return uris
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # Try newline-delimited JSON (one outbound object per line)
+    try:
+        uris = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            ob = json.loads(line)
+            uri = outbound_to_uri(ob)
+            if uri:
+                uris.append(uri)
+        if uris:
+            return uris
+    except Exception:
+        pass
+
+    return None
+
+
+def _parse_body(raw: str) -> tuple[list[str] | None, str]:
+    """
+    Detect and parse a subscription body.
+    Returns (lines, format_name) or (None, "unknown").
+    """
+    # 1. Plain proxy URIs (most common — one per line)
+    plain = [l.strip() for l in raw.splitlines() if l.strip()]
+    if any(l.lower().startswith(PROXY_PREFIXES) for l in plain):
+        return plain, "plain-text"
+
+    # 2. Xray / sing-box JSON
+    result = _parse_xray_json(raw)
+    if result:
+        return result, "xray-json"
+
+    # 3. Base64-encoded body
+    result = _try_b64(raw)
+    if result:
+        return result, "base64"
+
+    # 4. Double-encoded — each line is base64
+    for line in plain:
+        result = _try_b64(line)
+        if result:
+            return result, "base64-per-line"
+
+    return None, "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Subscription fetcher (with UA fallback chain)
 # ---------------------------------------------------------------------------
 async def fetch_subscription_lines(url: str) -> tuple[list[str], dict]:
     """
-    Fetch a subscription URL with HWID headers (Remnawave standard).
-    Returns (lines, response_headers).
-    Registration is automatic — the panel registers the device on first request
-    that includes the x-hwid header, as long as the device limit isn't exceeded.
+    Fetch subscription with Remnawave HWID headers.
+    Tries each UA in SUBSCRIPTION_UA_CHAIN until the response parses successfully.
+    Returns (proxy_lines, last_response_headers).
     """
-    # Remnawave HWID standard: https://docs.rw/docs/features/hwid-device-limit
-    headers = {
+    base_headers = {
         "x-hwid": HWID,
         "x-device-os": "Linux",
         "x-ver-os": "6.1",
         "x-device-model": "Server",
-        "User-Agent": "Happ/1.0",
     }
-    logger.info("Fetching subscription  HWID=%s  url=%s", HWID, url)
-    async with _make_client(timeout=20, follow_redirects=True) as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        raw = response.text.strip()
-        resp_headers = dict(response.headers)
 
-    # Log HWID status from response headers
-    hwid_active = resp_headers.get("x-hwid-active", "")
-    hwid_not_supported = resp_headers.get("x-hwid-not-supported", "")
-    hwid_max_reached = resp_headers.get("x-hwid-max-devices-reached", "")
-    hwid_limit = resp_headers.get("x-hwid-limit", "")
-    logger.info(
-        "Subscription response HWID headers: active=%s not_supported=%s max_reached=%s limit=%s",
-        hwid_active, hwid_not_supported, hwid_max_reached, hwid_limit,
-    )
+    last_resp_headers: dict = {}
+    last_raw: str = ""
 
-    def _try_b64(data: str) -> list[str] | None:
-        """Try both standard and URL-safe base64 with correct padding."""
-        for decoder in (base64.b64decode, base64.urlsafe_b64decode):
-            try:
-                padded = data + "=" * (-len(data) % 4)
-                decoded = decoder(padded.encode()).decode("utf-8")
-                lines = [l.strip() for l in decoded.splitlines() if l.strip()]
-                if any(l.lower().startswith(PROXY_PREFIXES) for l in lines):
-                    return lines
-            except Exception:
-                continue
-        return None
+    for attempt, ua in enumerate(SUBSCRIPTION_UA_CHAIN, start=1):
+        headers = {**base_headers, "User-Agent": ua}
+        logger.info("Subscription attempt %d/%d  UA=%r  url=%s  HWID=%s",
+                    attempt, len(SUBSCRIPTION_UA_CHAIN), ua, url, HWID)
+        try:
+            async with _make_client(timeout=20, follow_redirects=True) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                raw = response.text.strip()
+                last_resp_headers = dict(response.headers)
+                last_raw = raw
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Attempt %d HTTP %s, trying next UA", attempt, exc.response.status_code)
+            continue
+        except httpx.RequestError as exc:
+            logger.warning("Attempt %d network error: %s, trying next UA", attempt, exc)
+            continue
 
-    # 1. Try decoding the whole body as base64
-    decoded_lines = _try_b64(raw)
-    if decoded_lines:
-        logger.info("Subscription decoded from base64: %d lines", len(decoded_lines))
-        return decoded_lines, resp_headers
+        # Log Remnawave HWID response headers
+        logger.info(
+            "HWID response: active=%s not_supported=%s max_reached=%s limit=%s",
+            last_resp_headers.get("x-hwid-active", ""),
+            last_resp_headers.get("x-hwid-not-supported", ""),
+            last_resp_headers.get("x-hwid-max-devices-reached", ""),
+            last_resp_headers.get("x-hwid-limit", ""),
+        )
 
-    # 2. Plain text — split by lines
-    plain_lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    if any(l.lower().startswith(PROXY_PREFIXES) for l in plain_lines):
-        logger.info("Subscription plain text: %d lines", len(plain_lines))
-        return plain_lines, resp_headers
+        lines, fmt = _parse_body(raw)
+        if lines:
+            logger.info("Subscription parsed as %r with UA=%r: %d lines", fmt, ua, len(lines))
+            return lines, last_resp_headers
 
-    # 3. Maybe the single line is itself base64 (some panels wrap once more)
-    for line in plain_lines:
-        decoded_lines = _try_b64(line)
-        if decoded_lines:
-            logger.info("Subscription double-encoded base64: %d lines", len(decoded_lines))
-            return decoded_lines, resp_headers
+        logger.warning("Attempt %d UA=%r: body unrecognised (preview=%r), trying next UA",
+                       attempt, ua, raw[:80])
 
-    # 4. Return raw lines as-is and let caller deal with it
-    logger.warning("Subscription: could not detect format, returning %d raw lines  preview=%r",
-                   len(plain_lines), raw[:120])
-    return plain_lines, resp_headers
+    # All UAs failed — return raw lines so caller can show the error
+    logger.error("All UA attempts failed for %s  preview=%r", url, last_raw[:120])
+    plain_fallback = [l.strip() for l in last_raw.splitlines() if l.strip()]
+    return plain_fallback, last_resp_headers
 
 
 async def geo_for_host(host: str) -> tuple[str, dict]:
