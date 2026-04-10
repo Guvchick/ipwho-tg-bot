@@ -519,11 +519,48 @@ async def proxy_and_reply(update: Update, uri: str) -> None:
         await msg.edit_text(f"Ошибка: {exc}")
 
 
+def _is_error_entry(v: dict) -> bool:
+    """Return True if this proxy entry is a server-side error placeholder."""
+    host = str(v.get("host", ""))
+    port = str(v.get("port", ""))
+    name = str(v.get("name", "")).lower()
+    error_keywords = ("not supported", "contact support", "app not supported",
+                      "unsupported", "register", "activate")
+    return (
+        host in ("0.0.0.0", "127.0.0.1", "::1", "")
+        or port in ("0", "1", "")
+        or any(kw in name for kw in error_keywords)
+    )
+
+
 async def subscription_and_reply(update: Update, url: str) -> None:
-    msg = await update.message.reply_text("Загружаю подписку...")
+    msg = await update.message.reply_text(
+        f"Загружаю подписку...\n_HWID: `{HWID}`_",
+        parse_mode="Markdown",
+    )
     try:
         lines = await fetch_subscription_lines(url)
-        proxies = [p for line in lines if (p := parse_proxy_uri(line)) is not None]
+        all_proxies = [p for line in lines if (p := parse_proxy_uri(line)) is not None]
+
+        # Separate valid entries from error placeholders
+        error_entries = [p for p in all_proxies if _is_error_entry(p)]
+        proxies = [p for p in all_proxies if not _is_error_entry(p)]
+
+        if error_entries and not proxies:
+            names = ", ".join(e["name"] for e in error_entries[:3])
+            logger.warning(
+                "Subscription returned only error entries (HWID rejected?): %s  HWID=%s  url=%s",
+                names, HWID, url,
+            )
+            await msg.edit_text(
+                f"Сервер отклонил запрос.\n\n"
+                f"Ответ сервера: _{names}_\n\n"
+                f"Возможная причина: HWID не зарегистрирован на сервере.\n"
+                f"Зарегистрируй этот HWID в панели провайдера:\n"
+                f"`{HWID}`",
+                parse_mode="Markdown",
+            )
+            return
 
         if not proxies:
             await msg.edit_text(
@@ -533,7 +570,8 @@ async def subscription_and_reply(update: Update, url: str) -> None:
 
         total = len(proxies)
         to_lookup = proxies[:SUB_GEO_LIMIT]
-        logger.info("Subscription: %d total servers, geo-lookup for first %d", total, len(to_lookup))
+        logger.info("Subscription: %d valid servers (%d errors filtered), geo-lookup for first %d  HWID=%s",
+                    total, len(error_entries), len(to_lookup), HWID)
 
         await msg.edit_text(
             f"Найдено серверов: *{total}*. Получаю геолокацию для первых {len(to_lookup)}...",
