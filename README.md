@@ -1,36 +1,47 @@
 # ipwho-tg-bot
 
-Telegram-бот для получения геолокации и сетевой информации по IP-адресу через API [ipwho.is](https://ipwho.is).
+Telegram-бот для анализа IP-адресов, доменов, прокси-ключей и подписок. Использует [ipwho.is](https://ipwho.is) для геолокации.
 
 ---
 
 ## Возможности
 
-- Поиск по IPv4 и IPv6
-- Команда `/ip <адрес>` или просто отправить IP в чат
-- Возвращает: страну, регион, город, координаты, ASN, ISP, организацию, часовой пояс
-- Поддержка API-ключа ipwho.is для повышенных лимитов
+| Ввод | Что делает |
+|---|---|
+| `8.8.8.8` / `2001:db8::1` | Геолокация IP (ipinfo + MaxMind) |
+| `google.com` | Резолв домена → геолокация |
+| `vless://...` / `vmess://...` / `trojan://...` | Парсинг ключа + геолокация сервера |
+| `https://...` | Загрузка подписки, каждый сервер — отдельное сообщение |
+
+**Форматы подписок:**
+- Plain-text (один URI на строку)
+- Base64 / URL-safe Base64
+- Xray JSON (`{"outbounds": [...]}`)
+- Newline-delimited JSON
+- Double base64
+
+**Поддерживаемые панели:** Remnawave, Marzban, 3x-ui, Hiddify и любые совместимые.
+
+**HWID (Remnawave):** Бот автоматически определяет HWID из `/etc/machine-id` и передаёт его через заголовки при загрузке подписки — устройство регистрируется на первом запросе.
+
+**Кнопки под каждым ответом:** `bgp.he.net` · `bgp.tools` · `ipinfo.io` · `whois` · `AS{номер}`
 
 ---
 
 ## Требования к ВМ
 
-**Для запуска через Docker (рекомендуется):**
-- ОС: Ubuntu 22.04 / Debian 12 (или любой Linux-дистрибутив)
+**Docker (рекомендуется):**
+- Ubuntu 22.04 / Debian 12 или любой Linux
 - Docker + Docker Compose
 - Git
-- Доступ в интернет
 
-**Для запуска без Docker:**
+**Без Docker:**
 - Python 3.10+
 - Git
-- Доступ в интернет
 
 ---
 
 ## 1. Подготовка ВМ
-
-Обновите систему и установите Git:
 
 ```bash
 sudo apt update && sudo apt upgrade -y
@@ -52,48 +63,46 @@ cd ipwho-tg-bot
 
 ## 3. Получение токена Telegram-бота
 
-1. Откройте Telegram и найдите [@BotFather](https://t.me/BotFather)
-2. Отправьте команду `/newbot`
-3. Введите имя бота (например: `My IPWho Bot`)
-4. Введите username бота (например: `my_ipwho_bot`) — должен заканчиваться на `bot`
-5. Скопируйте выданный токен вида `123456789:AAF...`
+1. Найдите [@BotFather](https://t.me/BotFather) в Telegram
+2. Отправьте `/newbot`
+3. Введите имя и username бота (username должен заканчиваться на `bot`)
+4. Скопируйте токен вида `123456789:AAF...`
 
 ---
 
-## 4. Получение API-ключа ipwho.is
+## 4. Получение API-ключа ipwho.is (опционально)
 
-API-ключ нужен для снятия лимитов на количество запросов.
+Нужен для снятия лимитов на запросы геолокации.
 
 1. Зарегистрируйтесь на [ipwho.org](https://www.ipwho.org)
-2. Перейдите в личный кабинет → раздел **API Keys**
-3. Скопируйте ваш `access_key`
+2. Перейдите в личный кабинет → **API Keys**
+3. Скопируйте `access_key`
 
-> Без ключа бот работает в бесплатном режиме с ограниченным числом запросов. Ключ можно оставить пустым.
+> Без ключа бот работает в бесплатном режиме. Ключ можно не указывать.
 
 ---
 
 ## 5. Настройка переменных окружения
 
-Создайте файл `.env` на основе примера:
-
 ```bash
 cp .env.example .env
-```
-
-Откройте для редактирования:
-
-```bash
 nano .env
 ```
 
-Заполните оба значения:
+Заполните файл:
 
-```
+```env
+# Обязательно
 BOT_TOKEN=123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-IPWHO_ACCESS_KEY=ваш_ключ_от_ipwho
+
+# Опционально — ключ ipwho.is для повышенных лимитов
+IPWHO_ACCESS_KEY=ваш_ключ
+
+# Опционально — переопределить HWID (по умолчанию читается из /etc/machine-id)
+# HWID=your_custom_hwid
 ```
 
-Сохраните: `Ctrl+O`, затем `Enter`, затем `Ctrl+X`.
+Сохраните: `Ctrl+O` → `Enter` → `Ctrl+X`.
 
 ---
 
@@ -107,7 +116,7 @@ sudo usermod -aG docker $USER
 newgrp docker
 ```
 
-Проверьте установку:
+Проверьте:
 
 ```bash
 docker --version
@@ -120,7 +129,7 @@ docker compose version
 docker compose up -d --build
 ```
 
-Флаг `-d` запускает контейнер в фоне. После этого бот работает автоматически и перезапускается при перезагрузке ВМ.
+Бот запускается в фоне и автоматически поднимается при перезагрузке ВМ.
 
 ### 6.3. Просмотр логов
 
@@ -128,19 +137,17 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-`Ctrl+C` для выхода из режима просмотра.
-
-### 6.4. Управление контейнером
+### 6.4. Управление
 
 | Действие | Команда |
 |---|---|
 | Запустить | `docker compose up -d` |
 | Остановить | `docker compose down` |
 | Перезапустить | `docker compose restart` |
-| Посмотреть логи | `docker compose logs -f` |
+| Логи | `docker compose logs -f` |
 | Статус | `docker compose ps` |
 
-### 6.5. Обновление бота
+### 6.5. Обновление
 
 ```bash
 git pull
@@ -149,7 +156,7 @@ docker compose up -d --build
 
 ---
 
-## 7. Запуск без Docker (альтернатива)
+## 7. Запуск без Docker
 
 ### 7.1. Установка Python
 
@@ -157,43 +164,28 @@ docker compose up -d --build
 sudo apt install -y python3 python3-pip python3-venv
 ```
 
-### 7.2. Создание виртуального окружения
+### 7.2. Виртуальное окружение
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-### 7.3. Установка зависимостей
-
-```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 7.4. Ручной запуск (для проверки)
+### 7.3. Запуск
 
 ```bash
 python3 bot.py
 ```
 
-В терминале появится:
-
-```
-Bot is running...
-```
-
-Нажмите `Ctrl+C` для остановки.
-
-### 7.5. Автозапуск через systemd
-
-Создайте файл сервиса:
+### 7.4. Автозапуск через systemd
 
 ```bash
 sudo nano /etc/systemd/system/ipwho-bot.service
 ```
 
-Вставьте содержимое, заменив `/home/ubuntu/ipwho-tg-bot` на ваш реальный путь и `ubuntu` на вашего пользователя:
+Вставьте, заменив путь и пользователя на свои:
 
 ```ini
 [Unit]
@@ -213,23 +205,12 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Сохраните: `Ctrl+O`, `Enter`, `Ctrl+X`.
-
-Включите и запустите:
-
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable ipwho-bot
 sudo systemctl start ipwho-bot
-```
-
-Проверьте статус:
-
-```bash
 sudo systemctl status ipwho-bot
 ```
-
-Вы должны увидеть `Active: active (running)`.
 
 Обновление:
 
@@ -249,45 +230,101 @@ ipwho-tg-bot/
 ├── Dockerfile          # Docker-образ
 ├── docker-compose.yml  # Docker Compose конфигурация
 ├── requirements.txt    # Python-зависимости
-├── .env.example        # Пример файла конфигурации
-├── .env                # Ваш файл конфигурации (не коммитить!)
-└── README.md           # Документация
+├── .env.example        # Пример конфигурации
+├── .env                # Конфигурация (не коммитить!)
+└── README.md
 ```
 
 ---
 
-## Использование бота
+## Примеры ответов
 
-После запуска откройте бота в Telegram:
-
-- `/start` — приветствие и инструкция
-- `/ip 8.8.8.8` — геолокация по IP
-- Отправить `1.1.1.1` в чат — то же самое без команды
-
-Пример ответа:
+### IP / домен
 
 ```
-🇺🇸 IP Info: 8.8.8.8
-Type: IPv4
+🇺🇸 8.8.8.8
 
-Location
-Continent: North America (NA)
-Country: United States (US)
-Region: California (CA)
-City: Mountain View
-Postal: 94039
-Capital: Washington D.C.
-Coordinates: 37.386, -122.084
-EU member: No
+ipinfo
+org: AS15169 Google LLC
+hostname: google.com
+timezone: America/Los_Angeles
 
-Connection
-ASN: 15169
-ISP: Google LLC
-Organization: Google LLC
-Domain: google.com
+MaxMind
+country: United States (US) 🇺🇸
+city: California, Mountain View
+coordinates: 37.3861, -122.0839
+type: IPv4
 
-Timezone
-Zone: America/Los_Angeles
-UTC offset: -07:00
-DST: Yes
+[ bgp.he.net ] [ bgp.tools ]
+[ ipinfo.io  ] [ whois     ]
+[    AS15169              ]
 ```
+
+### VLESS / VMess / Trojan ключ
+
+```
+VLESS — My Server
+
+Server
+Host: example.com
+Port: 443
+UUID: xxxxxxxx-...
+
+Transport
+Network: ws
+Security: tls
+SNI: example.com
+...
+
+ipinfo 🇩🇪
+ip: 1.2.3.4
+org: AS12345 Hetzner Online GmbH
+hostname: static.1.2.3.4.hetzner.com
+timezone: Europe/Berlin
+
+MaxMind
+country: Germany (DE)
+city: Bavaria, Nuremberg
+coordinates: 49.4478, 11.0683
+
+[ bgp.he.net ] [ bgp.tools ]
+[ ipinfo.io  ] [ whois     ]
+[    AS12345              ]
+```
+
+### Подписка
+
+```
+📋 Подписка — 5 серверов
+Получаю геолокацию...
+
+1/5           ← отдельное сообщение
+VLESS — DE-1
+...
+
+2/5           ← отдельное сообщение
+VMESS — US-2
+...
+
+📋 Подписка — 5 серверов ✓
+```
+
+---
+
+## HWID и Remnawave
+
+Бот передаёт HWID через заголовки при каждом запросе подписки:
+
+```
+x-hwid: <machine-id>
+x-device-os: Linux
+x-device-model: Server
+User-Agent: Happ/1.0
+```
+
+HWID определяется автоматически (`/etc/machine-id` → MAC-адрес → `HWID` из `.env`).  
+При первом запросе устройство регистрируется в панели автоматически.
+
+Если сервер отклонил запрос — бот покажет причину (`лимит устройств` / `HWID не принят`) и выведет HWID для ручной регистрации в панели провайдера.
+
+**UA fallback:** если один User-Agent вернул нераспознаваемый ответ, бот автоматически пробует следующий из цепочки: `Happ → v2RayTun → ClashForAndroid → ClashMeta → python-httpx`.
