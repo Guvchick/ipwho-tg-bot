@@ -1,143 +1,104 @@
 # ipwho-tg-bot
 
-Telegram-бот для анализа IP-адресов, доменов, прокси-ключей и подписок. Использует [ipwho.is](https://ipwho.is) для геолокации.
+Telegram-бот на Go для проверки IP, доменов, proxy-ключей и подписок.
 
----
+Бот отвечает в аккуратном коротком формате:
+
+```text
+🇷🇺 www.gosuslugi.ru
+
+213.59.253.7
+
+🌍 MaxMind
+🇷🇺 RU / Russia
+AS12389 / Rostelecom
+
+📍 IPinfo
+🇷🇺 RU / Russia / Moscow
+AS12389 / PJSC Rostelecom
+
+🔎 Censys
+https://search.censys.io/hosts/213.59.253.7
+```
 
 ## Возможности
 
 | Ввод | Что делает |
 |---|---|
-| `8.8.8.8` / `2001:db8::1` | Геолокация IP (ipinfo + MaxMind) |
-| `google.com` | Резолв домена → геолокация |
-| `vless://...` / `vmess://...` / `trojan://...` | Парсинг ключа + геолокация сервера |
-| `https://...` | Загрузка подписки, каждый сервер — отдельное сообщение |
+| `8.8.8.8` | Геолокация IP |
+| `45.150.65.65:443` | Достаёт IP из строки с портом |
+| `9/18 — 45.150.65.65:443` | Достаёт IP из произвольного текста |
+| `example.com` | Резолвит домен и показывает IP-инфо |
+| `vless://...`, `vmess://...`, `trojan://...`, `ss://...` | Парсит ключ и проверяет сервер |
+| `https://...` | Загружает подписку и отправляет каждый сервер отдельным сообщением |
 
-**Форматы подписок:**
-- Plain-text (один URI на строку)
-- Base64 / URL-safe Base64
-- Xray JSON (`{"outbounds": [...]}`)
-- Newline-delimited JSON
-- Double base64
+Подписки поддерживаются в plain-text, base64, URL-safe base64, Xray JSON и newline-delimited JSON.
 
-**Поддерживаемые панели:** Remnawave, Marzban, 3x-ui, Hiddify и любые совместимые.
+Под каждым ответом есть кнопки с эмодзи: `🌐 bgp.he.net`, `🧭 bgp.tools`, `📍 ipinfo.io`, `🔎 Censys`, `📜 whois`, `🛰 AS...`.
 
-**HWID (Remnawave):** Бот автоматически определяет HWID из `/etc/machine-id` и передаёт его через заголовки при загрузке подписки — устройство регистрируется на первом запросе.
+Можно отправить сразу несколько разных строк через Enter: IP, домены, ключи и ссылки будут поставлены в очередь и обработаны по порядку.
 
-**Кнопки под каждым ответом:** `bgp.he.net` · `bgp.tools` · `ipinfo.io` · `whois` · `AS{номер}`
+## Что исправлено
 
----
+- Бот полностью переписан на Go.
+- Ответы отправляются в Telegram HTML mode с экранированием пользовательских данных, поэтому ошибка `Can't parse entities...` больше не должна появляться из-за `_`, `[`, `(` и других символов в названиях серверов.
+- `Reserved range` больше не ломает обработку: бот показывает понятное примечание для частных/зарезервированных IP.
+- Строки вида `9/18 — 45.150.65.65:443` корректно распознаются.
+- Добавлена глобальная очередь: один worker обрабатывает запросы последовательно, а новые запросы ждут своей очереди.
+- Гео-запросы внутри одного задания выполняются параллельно, DNS и гео-ответы кешируются.
+- Добавлен Censys: всегда есть ссылка, а при наличии API-ключей бот дополнительно показывает найденные сервисы/порты.
+- Добавлены эмодзи для стран, статусов, разделов и inline-кнопок.
+- Добавлена обработка нескольких разных запросов в одном сообщении через Enter.
 
-## Требования к ВМ
+## Настройка
 
-**Docker (рекомендуется):**
-- Ubuntu 22.04 / Debian 12 или любой Linux
-- Docker + Docker Compose
-- Git
-
-**Без Docker:**
-- Python 3.10+
-- Git
-
----
-
-## 1. Подготовка ВМ
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y git
-```
-
----
-
-## 2. Клонирование репозитория
-
-```bash
-git clone https://github.com/<your-username>/ipwho-tg-bot.git
-cd ipwho-tg-bot
-```
-
-> Замените `<your-username>` на ваш GitHub-логин.
-
----
-
-## 3. Получение токена Telegram-бота
-
-1. Найдите [@BotFather](https://t.me/BotFather) в Telegram
-2. Отправьте `/newbot`
-3. Введите имя и username бота (username должен заканчиваться на `bot`)
-4. Скопируйте токен вида `123456789:AAF...`
-
----
-
-## 4. Получение API-ключа ipwho.is (опционально)
-
-Нужен для снятия лимитов на запросы геолокации.
-
-1. Зарегистрируйтесь на [ipwho.org](https://www.ipwho.org)
-2. Перейдите в личный кабинет → **API Keys**
-3. Скопируйте `access_key`
-
-> Без ключа бот работает в бесплатном режиме. Ключ можно не указывать.
-
----
-
-## 5. Настройка переменных окружения
+Скопируйте пример окружения:
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Заполните файл:
+Минимально нужен только токен Telegram:
 
 ```env
-# Обязательно
 BOT_TOKEN=123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# Опционально — ключ ipwho.is для повышенных лимитов
-IPWHO_ACCESS_KEY=ваш_ключ
-
-# Опционально — переопределить HWID (по умолчанию читается из /etc/machine-id)
-# HWID=your_custom_hwid
 ```
 
-Сохраните: `Ctrl+O` → `Enter` → `Ctrl+X`.
+Опциональные переменные:
 
----
+```env
+IPWHO_ACCESS_KEY=your_ipwho_access_key
+IPINFO_TOKEN=your_ipinfo_token
 
-## 6. Запуск через Docker (рекомендуется)
+CENSYS_API_ID=your_censys_api_id
+CENSYS_API_SECRET=your_censys_api_secret
 
-### 6.1. Установка Docker
-
-```bash
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-newgrp docker
+QUEUE_SIZE=128
+GEO_CONCURRENCY=8
+SUB_MESSAGE_DELAY_MS=450
+DNS_CACHE_TTL_MINUTES=30
+GEO_CACHE_TTL_MINUTES=10
+HWID=your_custom_hwid
 ```
 
-Проверьте:
+Если `CENSYS_API_ID` и `CENSYS_API_SECRET` не заданы, Censys всё равно будет добавлен как ссылка.
 
-```bash
-docker --version
-docker compose version
-```
+`GEO_CONCURRENCY` управляет параллельными DNS/geo-запросами внутри одной подписки. Очередь пользователей при этом остаётся последовательной.
 
-### 6.2. Сборка и запуск
+## Запуск через Docker
 
 ```bash
 docker compose up -d --build
 ```
 
-Бот запускается в фоне и автоматически поднимается при перезагрузке ВМ.
-
-### 6.3. Просмотр логов
+Логи:
 
 ```bash
 docker compose logs -f
 ```
 
-### 6.4. Управление
+Управление:
 
 | Действие | Команда |
 |---|---|
@@ -147,45 +108,24 @@ docker compose logs -f
 | Логи | `docker compose logs -f` |
 | Статус | `docker compose ps` |
 
-### 6.5. Обновление
+## Запуск без Docker
+
+Нужен Go 1.22+.
 
 ```bash
-git pull
-docker compose up -d --build
+go run .
 ```
 
----
-
-## 7. Запуск без Docker
-
-### 7.1. Установка Python
+Сборка бинарника:
 
 ```bash
-sudo apt install -y python3 python3-pip python3-venv
+go build -o ipwho-tg-bot .
+./ipwho-tg-bot
 ```
 
-### 7.2. Виртуальное окружение
+## systemd
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### 7.3. Запуск
-
-```bash
-python3 bot.py
-```
-
-### 7.4. Автозапуск через systemd
-
-```bash
-sudo nano /etc/systemd/system/ipwho-bot.service
-```
-
-Вставьте, заменив путь и пользователя на свои:
+Пример сервиса:
 
 ```ini
 [Unit]
@@ -197,7 +137,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/ipwho-tg-bot
 EnvironmentFile=/home/ubuntu/ipwho-tg-bot/.env
-ExecStart=/home/ubuntu/ipwho-tg-bot/venv/bin/python3 bot.py
+ExecStart=/home/ubuntu/ipwho-tg-bot/ipwho-tg-bot
 Restart=always
 RestartSec=5
 
@@ -205,126 +145,47 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
+Команды:
+
 ```bash
+go build -o ipwho-tg-bot .
 sudo systemctl daemon-reload
 sudo systemctl enable ipwho-bot
-sudo systemctl start ipwho-bot
+sudo systemctl restart ipwho-bot
 sudo systemctl status ipwho-bot
 ```
 
-Обновление:
+## Структура
 
-```bash
-git pull
-pip install -r requirements.txt
-sudo systemctl restart ipwho-bot
-```
-
----
-
-## Структура проекта
-
-```
+```text
 ipwho-tg-bot/
-├── bot.py              # Основной код бота
-├── Dockerfile          # Docker-образ
-├── docker-compose.yml  # Docker Compose конфигурация
-├── requirements.txt    # Python-зависимости
-├── .env.example        # Пример конфигурации
-├── .env                # Конфигурация (не коммитить!)
+├── main.go
+├── go.mod
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
 └── README.md
 ```
 
----
+## HWID и подписки
 
-## Примеры ответов
+Для Remnawave/совместимых панелей бот передаёт:
 
-### IP / домен
-
-```
-🇺🇸 8.8.8.8
-
-ipinfo
-org: AS15169 Google LLC
-hostname: google.com
-timezone: America/Los_Angeles
-
-MaxMind
-country: United States (US) 🇺🇸
-city: California, Mountain View
-coordinates: 37.3861, -122.0839
-type: IPv4
-
-[ bgp.he.net ] [ bgp.tools ]
-[ ipinfo.io  ] [ whois     ]
-[    AS15169              ]
-```
-
-### VLESS / VMess / Trojan ключ
-
-```
-VLESS — My Server
-
-Server
-Host: example.com
-Port: 443
-UUID: xxxxxxxx-...
-
-Transport
-Network: ws
-Security: tls
-SNI: example.com
-...
-
-ipinfo 🇩🇪
-ip: 1.2.3.4
-org: AS12345 Hetzner Online GmbH
-hostname: static.1.2.3.4.hetzner.com
-timezone: Europe/Berlin
-
-MaxMind
-country: Germany (DE)
-city: Bavaria, Nuremberg
-coordinates: 49.4478, 11.0683
-
-[ bgp.he.net ] [ bgp.tools ]
-[ ipinfo.io  ] [ whois     ]
-[    AS12345              ]
-```
-
-### Подписка
-
-```
-📋 Подписка — 5 серверов
-Получаю геолокацию...
-
-1/5           ← отдельное сообщение
-VLESS — DE-1
-...
-
-2/5           ← отдельное сообщение
-VMESS — US-2
-...
-
-📋 Подписка — 5 серверов ✓
-```
-
----
-
-## HWID и Remnawave
-
-Бот передаёт HWID через заголовки при каждом запросе подписки:
-
-```
+```text
 x-hwid: <machine-id>
 x-device-os: Linux
+x-ver-os: 6.1
 x-device-model: Server
-User-Agent: Happ/1.0
 ```
 
-HWID определяется автоматически (`/etc/machine-id` → MAC-адрес → `HWID` из `.env`).  
-При первом запросе устройство регистрируется в панели автоматически.
+HWID определяется так: `HWID` из окружения, затем `/etc/machine-id`, затем MAC-адрес.
 
-Если сервер отклонил запрос — бот покажет причину (`лимит устройств` / `HWID не принят`) и выведет HWID для ручной регистрации в панели провайдера.
+User-Agent fallback:
 
-**UA fallback:** если один User-Agent вернул нераспознаваемый ответ, бот автоматически пробует следующий из цепочки: `Happ → v2RayTun → ClashForAndroid → ClashMeta → python-httpx`.
+```text
+Happ/1.0
+v2RayTun/5.0
+ClashForAndroid/2.5.12
+ClashMeta/1.18.0
+ipwho-tg-bot-go/1.0
+```
