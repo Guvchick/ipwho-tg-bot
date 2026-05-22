@@ -18,7 +18,7 @@ AS12389 / Rostelecom
 AS12389 / PJSC Rostelecom
 
 🔎 Censys
-https://search.censys.io/hosts/213.59.253.7
+https://platform.censys.io/search?q=213.59.253.7
 ```
 
 ## Возможности
@@ -73,8 +73,11 @@ BOT_TOKEN=123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 IPWHO_ACCESS_KEY=your_ipwho_access_key
 IPINFO_TOKEN=your_ipinfo_token
 
-CENSYS_API_ID=your_censys_api_id
-CENSYS_API_SECRET=your_censys_api_secret
+CENSYS_PAT=your_censys_platform_personal_access_token
+
+# Legacy fallback:
+# CENSYS_API_ID=your_legacy_censys_api_id
+# CENSYS_API_SECRET=your_legacy_censys_api_secret
 
 QUEUE_SIZE=128
 GEO_CONCURRENCY=8
@@ -87,7 +90,7 @@ SERVER_STORE_MAX=2000
 HWID=your_custom_hwid
 ```
 
-Если `CENSYS_API_ID` и `CENSYS_API_SECRET` не заданы, Censys всё равно будет добавлен как ссылка.
+Если `CENSYS_PAT` не задан, Censys всё равно будет добавлен как ссылка на Platform. Старые `CENSYS_API_ID`/`CENSYS_API_SECRET` оставлены только как fallback для Legacy Search API.
 
 `GEO_CONCURRENCY` управляет параллельными DNS/geo-запросами внутри одной подписки. Очередь пользователей при этом остаётся последовательной.
 

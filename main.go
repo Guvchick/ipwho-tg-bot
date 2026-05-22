@@ -28,7 +28,7 @@ import (
 const (
 	ipwhoBaseURL    = "https://ipwho.is"
 	ipinfoBaseURL   = "https://ipinfo.io"
-	censysHostURL   = "https://search.censys.io/hosts"
+	censysHostURL   = "https://platform.censys.io/search?q="
 	telegramTimeout = 50 * time.Second
 )
 
@@ -57,6 +57,7 @@ type Config struct {
 	IPInfoToken        string
 	CensysAPIID        string
 	CensysAPISecret    string
+	CensysPAT          string
 	HWID               string
 	QueueSize          int
 	GeoConcurrency     int
@@ -159,19 +160,13 @@ type IPInfoResponse struct {
 }
 
 type CensysHostResponse struct {
-	Result struct {
-		Services []struct {
-			Port        int    `json:"port"`
-			ServiceName string `json:"service_name"`
-			Transport   string `json:"transport_protocol"`
-		} `json:"services"`
-		Location struct {
-			Country     string `json:"country"`
-			CountryCode string `json:"country_code"`
-			City        string `json:"city"`
-		} `json:"location"`
-	} `json:"result"`
-	Error string `json:"error"`
+	Services []CensysService
+}
+
+type CensysService struct {
+	Port        int
+	ServiceName string
+	Transport   string
 }
 
 type GeoBundle struct {
@@ -282,8 +277,8 @@ func main() {
 	if cfg.IPWhoAccessKey == "" {
 		logWarn("ipwho access key is not set; free limits apply")
 	}
-	if cfg.CensysAPIID == "" || cfg.CensysAPISecret == "" {
-		logWarn("censys credentials are not set; using links only")
+	if cfg.CensysPAT == "" && (cfg.CensysAPIID == "" || cfg.CensysAPISecret == "") {
+		logWarn("censys credentials are not set; using platform links only")
 	}
 
 	go worker(context.Background(), app, jobs)
@@ -296,14 +291,20 @@ func loadConfig() Config {
 	delayMs := envInt("SUB_MESSAGE_DELAY_MS", 450)
 	dnsTTLMinutes := envInt("DNS_CACHE_TTL_MINUTES", 30)
 	geoTTLMinutes := envInt("GEO_CACHE_TTL_MINUTES", 10)
-	storePath := firstNonEmpty(os.Getenv("SERVER_STORE_PATH"), "/data/servers.json")
+	storePath := firstNonEmpty(envValue("SERVER_STORE_PATH"), "/data/servers.json")
 	storeMax := envInt("SERVER_STORE_MAX", 2000)
+	censysSecret := envValue("CENSYS_API_SECRET")
+	censysPAT := firstNonEmpty(envValue("CENSYS_PAT"), envValue("CENSYS_API_TOKEN"))
+	if strings.HasPrefix(censysSecret, "censys_") && censysPAT == "" {
+		censysPAT = censysSecret
+	}
 	return Config{
-		BotToken:           os.Getenv("BOT_TOKEN"),
-		IPWhoAccessKey:     os.Getenv("IPWHO_ACCESS_KEY"),
-		IPInfoToken:        os.Getenv("IPINFO_TOKEN"),
-		CensysAPIID:        os.Getenv("CENSYS_API_ID"),
-		CensysAPISecret:    os.Getenv("CENSYS_API_SECRET"),
+		BotToken:           envValue("BOT_TOKEN"),
+		IPWhoAccessKey:     envValue("IPWHO_ACCESS_KEY"),
+		IPInfoToken:        envValue("IPINFO_TOKEN"),
+		CensysAPIID:        envValue("CENSYS_API_ID"),
+		CensysAPISecret:    censysSecret,
+		CensysPAT:          censysPAT,
 		HWID:               getHWID(),
 		QueueSize:          queueSize,
 		GeoConcurrency:     geoConcurrency,
@@ -597,7 +598,7 @@ func loadDotEnv(path string) {
 }
 
 func envInt(key string, fallback int) int {
-	raw := strings.TrimSpace(os.Getenv(key))
+	raw := strings.TrimSpace(envValue(key))
 	if raw == "" {
 		return fallback
 	}
@@ -608,8 +609,24 @@ func envInt(key string, fallback int) int {
 	return val
 }
 
+func envValue(key string) string {
+	if val := os.Getenv(key); val != "" {
+		return strings.TrimSpace(val)
+	}
+	for _, item := range os.Environ() {
+		k, v, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(k) == key {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
 func getHWID() string {
-	if val := os.Getenv("HWID"); val != "" {
+	if val := envValue("HWID"); val != "" {
 		return val
 	}
 	for _, path := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
@@ -1127,14 +1144,23 @@ func fetchIPInfo(ctx context.Context, cfg Config, ip string) (*IPInfoResponse, e
 }
 
 func fetchCensys(ctx context.Context, cfg Config, ip string) (*CensysHostResponse, error) {
-	if cfg.CensysAPIID == "" || cfg.CensysAPISecret == "" {
+	if cfg.CensysPAT == "" && (cfg.CensysAPIID == "" || cfg.CensysAPISecret == "") {
 		return nil, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://search.censys.io/api/v2/hosts/"+url.PathEscape(ip), nil)
+	endpoint := "https://api.platform.censys.io/v3/global/asset/host/" + url.PathEscape(ip)
+	if cfg.CensysPAT == "" {
+		endpoint = "https://search.censys.io/api/v2/hosts/" + url.PathEscape(ip)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(cfg.CensysAPIID, cfg.CensysAPISecret)
+	req.Header.Set("Accept", "application/json")
+	if cfg.CensysPAT != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.CensysPAT)
+	} else {
+		req.SetBasicAuth(cfg.CensysAPIID, cfg.CensysAPISecret)
+	}
 	resp, err := apiHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -1150,11 +1176,59 @@ func fetchCensys(ctx context.Context, cfg Config, ip string) (*CensysHostRespons
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("Censys HTTP %d", resp.StatusCode)
 	}
-	var parsed CensysHostResponse
-	if err := json.Unmarshal(data, &parsed); err != nil {
+	services, err := parseCensysServices(data)
+	if err != nil {
 		return nil, err
 	}
-	return &parsed, nil
+	return &CensysHostResponse{Services: services}, nil
+}
+
+func parseCensysServices(data []byte) ([]CensysService, error) {
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	servicesRaw := findCensysServices(raw)
+	services := make([]CensysService, 0, len(servicesRaw))
+	for _, item := range servicesRaw {
+		service, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		port := intAny(firstAny(service["port"], service["port_number"]))
+		if port <= 0 {
+			continue
+		}
+		services = append(services, CensysService{
+			Port:        port,
+			ServiceName: strAny(firstAny(service["service_name"], service["protocol"], service["name"])),
+			Transport:   strAny(firstAny(service["transport_protocol"], service["transport"])),
+		})
+	}
+	return services, nil
+}
+
+func findCensysServices(raw any) []any {
+	switch v := raw.(type) {
+	case map[string]any:
+		if services, ok := v["services"].([]any); ok {
+			return services
+		}
+		for _, key := range []string{"result", "host", "asset", "resource"} {
+			if nested, ok := v[key]; ok {
+				if services := findCensysServices(nested); len(services) > 0 {
+					return services
+				}
+			}
+		}
+	case []any:
+		return v
+	}
+	return nil
+}
+
+func censysURL(ip string) string {
+	return censysHostURL + url.QueryEscape(ip)
 }
 
 func geoForIP(ctx context.Context, cfg Config, ip string) GeoBundle {
@@ -1206,7 +1280,7 @@ func geoForIP(ctx context.Context, cfg Config, ip string) GeoBundle {
 		bundle.Warnings = append(bundle.Warnings, "ipinfo.io: "+err.Error())
 	}()
 
-	if cfg.CensysAPIID != "" && cfg.CensysAPISecret != "" {
+	if cfg.CensysPAT != "" || (cfg.CensysAPIID != "" && cfg.CensysAPISecret != "") {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1322,14 +1396,14 @@ func formatIPInfo(info *IPInfoResponse, fallback *IPWhoResponse) []string {
 
 func formatCensys(ip string, censys *CensysHostResponse) []string {
 	if censys == nil {
-		return []string{"🔎 Censys", escape(censysHostURL + "/" + ip)}
+		return []string{"🔎 Censys", escape(censysURL(ip))}
 	}
-	if len(censys.Result.Services) == 0 {
+	if len(censys.Services) == 0 {
 		return []string{"🔎 Censys", "no indexed services"}
 	}
-	ports := make([]string, 0, len(censys.Result.Services))
+	ports := make([]string, 0, len(censys.Services))
 	seen := map[string]bool{}
-	for _, svc := range censys.Result.Services {
+	for _, svc := range censys.Services {
 		name := strings.ToLower(firstNonEmpty(svc.ServiceName, svc.Transport))
 		item := strconv.Itoa(svc.Port)
 		if name != "" {
@@ -1358,7 +1432,7 @@ func makeKeyboard(ip, asn string) *InlineKeyboardMarkup {
 		},
 		{
 			{Text: "📍 ipinfo.io", URL: "https://ipinfo.io/" + url.PathEscape(ip)},
-			{Text: "🔎 Censys", URL: censysHostURL + "/" + url.PathEscape(ip)},
+			{Text: "🔎 Censys", URL: censysURL(ip)},
 		},
 		{
 			{Text: "📜 whois", URL: "https://who.is/whois/" + url.PathEscape(ip)},
