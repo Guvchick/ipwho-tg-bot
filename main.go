@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -39,6 +40,7 @@ var (
 	proxyRe       = regexp.MustCompile(`(?i)(vless|vmess|trojan|ss)://[^\s]+`)
 	ipv4Re        = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
 	domainRe      = regexp.MustCompile(`(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b`)
+	tgTokenRe     = regexp.MustCompile(`bot\d+:[A-Za-z0-9_-]+`)
 
 	subscriptionUAChain = []string{
 		"Happ/1.0",
@@ -62,6 +64,8 @@ type Config struct {
 	DNSCacheTTL        time.Duration
 	GeoCacheTTL        time.Duration
 	TelegramAPITimeout time.Duration
+	ServerStorePath    string
+	ServerStoreMax     int
 }
 
 type TelegramClient struct {
@@ -104,6 +108,12 @@ type Job struct {
 	Message Message
 	User    User
 	Text    string
+}
+
+type App struct {
+	cfg   Config
+	bot   *TelegramClient
+	store *ServerStore
 }
 
 type IPWhoResponse struct {
@@ -204,27 +214,80 @@ type SubscriptionResult struct {
 	Bundle GeoBundle
 }
 
+type StoredUser struct {
+	ID        int64  `json:"id"`
+	Username  string `json:"username,omitempty"`
+	FirstName string `json:"first_name,omitempty"`
+}
+
+type StoredServer struct {
+	Key         string       `json:"key"`
+	FirstSeen   time.Time    `json:"first_seen"`
+	LastSeen    time.Time    `json:"last_seen"`
+	SeenCount   int          `json:"seen_count"`
+	Proto       string       `json:"proto"`
+	Name        string       `json:"name,omitempty"`
+	Host        string       `json:"host"`
+	Port        string       `json:"port"`
+	IP          string       `json:"ip,omitempty"`
+	ASN         string       `json:"asn,omitempty"`
+	Org         string       `json:"org,omitempty"`
+	CountryCode string       `json:"country_code,omitempty"`
+	Country     string       `json:"country,omitempty"`
+	City        string       `json:"city,omitempty"`
+	Users       []StoredUser `json:"users,omitempty"`
+	Sources     []string     `json:"sources,omitempty"`
+}
+
+type ServerStoreFile struct {
+	UpdatedAt time.Time      `json:"updated_at"`
+	Count     int           `json:"count"`
+	Servers   []StoredServer `json:"servers"`
+}
+
+type ServerStore struct {
+	mu      sync.Mutex
+	path    string
+	max     int
+	servers []StoredServer
+}
+
 func main() {
+	log.SetFlags(0)
 	loadDotEnv(".env")
 	cfg := loadConfig()
 	if cfg.BotToken == "" {
-		log.Fatal("BOT_TOKEN is not set")
+		logError("startup failed", "error", "BOT_TOKEN is not set")
+		os.Exit(1)
 	}
 
 	bot := NewTelegramClient(cfg.BotToken, cfg.TelegramAPITimeout)
+	store, err := NewServerStore(cfg.ServerStorePath, cfg.ServerStoreMax)
+	if err != nil {
+		logError("server store init failed", "path", cfg.ServerStorePath, "error", err)
+		os.Exit(1)
+	}
+	app := &App{cfg: cfg, bot: bot, store: store}
 	jobs := make(chan Job, cfg.QueueSize)
 
-	log.Printf("starting ipwho-tg-bot-go; hwid=%s queue=%d geo_concurrency=%d dns_cache=%s geo_cache=%s",
-		cfg.HWID, cfg.QueueSize, cfg.GeoConcurrency, cfg.DNSCacheTTL, cfg.GeoCacheTTL)
+	logInfo("bot starting",
+		"hwid", cfg.HWID,
+		"queue", cfg.QueueSize,
+		"geo_concurrency", cfg.GeoConcurrency,
+		"dns_cache", cfg.DNSCacheTTL,
+		"geo_cache", cfg.GeoCacheTTL,
+		"store_path", cfg.ServerStorePath,
+		"store_count", store.Count(),
+	)
 	if cfg.IPWhoAccessKey == "" {
-		log.Println("IPWHO_ACCESS_KEY is not set, ipwho.is free limits apply")
+		logWarn("ipwho access key is not set; free limits apply")
 	}
 	if cfg.CensysAPIID == "" || cfg.CensysAPISecret == "" {
-		log.Println("Censys API credentials are not set, using Censys links only")
+		logWarn("censys credentials are not set; using links only")
 	}
 
-	go worker(context.Background(), cfg, bot, jobs)
-	poll(context.Background(), cfg, bot, jobs)
+	go worker(context.Background(), app, jobs)
+	poll(context.Background(), app, jobs)
 }
 
 func loadConfig() Config {
@@ -233,6 +296,8 @@ func loadConfig() Config {
 	delayMs := envInt("SUB_MESSAGE_DELAY_MS", 450)
 	dnsTTLMinutes := envInt("DNS_CACHE_TTL_MINUTES", 30)
 	geoTTLMinutes := envInt("GEO_CACHE_TTL_MINUTES", 10)
+	storePath := firstNonEmpty(os.Getenv("SERVER_STORE_PATH"), "/data/servers.json")
+	storeMax := envInt("SERVER_STORE_MAX", 2000)
 	return Config{
 		BotToken:           os.Getenv("BOT_TOKEN"),
 		IPWhoAccessKey:     os.Getenv("IPWHO_ACCESS_KEY"),
@@ -246,6 +311,8 @@ func loadConfig() Config {
 		DNSCacheTTL:        time.Duration(dnsTTLMinutes) * time.Minute,
 		GeoCacheTTL:        time.Duration(geoTTLMinutes) * time.Minute,
 		TelegramAPITimeout: telegramTimeout,
+		ServerStorePath:    storePath,
+		ServerStoreMax:     storeMax,
 	}
 }
 
@@ -298,6 +365,210 @@ func (c *ttlCache[T]) Set(key string, value T, ttl time.Duration) {
 		expiresAt: time.Now().Add(ttl),
 	}
 	c.mu.Unlock()
+}
+
+func NewServerStore(path string, maxEntries int) (*ServerStore, error) {
+	if maxEntries <= 0 {
+		maxEntries = 2000
+	}
+	store := &ServerStore{
+		path: path,
+		max:  maxEntries,
+	}
+	if err := store.load(); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *ServerStore) Count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.servers)
+}
+
+func (s *ServerStore) load() error {
+	if s.path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var file ServerStoreFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return err
+	}
+	s.servers = file.Servers
+	s.compactLocked()
+	return nil
+}
+
+func (s *ServerStore) Upsert(proxy Proxy, ip string, bundle GeoBundle, user User, source string) error {
+	_, err := s.UpsertMany([]SubscriptionResult{{Proxy: proxy, IP: ip, Bundle: bundle}}, user, source)
+	return err
+}
+
+func (s *ServerStore) UpsertMany(results []SubscriptionResult, user User, source string) (int, error) {
+	if s == nil || s.path == "" || len(results) == 0 {
+		return 0, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changed := 0
+	now := time.Now().UTC()
+	index := make(map[string]int, len(s.servers))
+	for i := range s.servers {
+		index[s.servers[i].Key] = i
+	}
+
+	for _, result := range results {
+		key := serverKey(result.Proxy)
+		if key == "" {
+			continue
+		}
+		if i, ok := index[key]; ok {
+			updateStoredServer(&s.servers[i], result, user, source, now)
+			changed++
+			continue
+		}
+		server := newStoredServer(result, user, source, now)
+		s.servers = append(s.servers, server)
+		index[server.Key] = len(s.servers) - 1
+		changed++
+	}
+
+	if changed == 0 {
+		return 0, nil
+	}
+	s.compactLocked()
+	if err := s.saveLocked(); err != nil {
+		return changed, err
+	}
+	return changed, nil
+}
+
+func (s *ServerStore) compactLocked() {
+	sort.SliceStable(s.servers, func(i, j int) bool {
+		return s.servers[i].LastSeen.After(s.servers[j].LastSeen)
+	})
+	if s.max > 0 && len(s.servers) > s.max {
+		s.servers = s.servers[:s.max]
+	}
+}
+
+func (s *ServerStore) saveLocked() error {
+	if s.path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+		return err
+	}
+	file := ServerStoreFile{
+		UpdatedAt: time.Now().UTC(),
+		Count:     len(s.servers),
+		Servers:   s.servers,
+	}
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+func newStoredServer(result SubscriptionResult, user User, source string, now time.Time) StoredServer {
+	server := StoredServer{
+		Key:       serverKey(result.Proxy),
+		FirstSeen: now,
+		LastSeen:  now,
+		SeenCount: 1,
+		Proto:     result.Proxy.Proto,
+		Name:      cleanStoredValue(result.Proxy.Name),
+		Host:      result.Proxy.Host,
+		Port:      result.Proxy.Port,
+		IP:        result.IP,
+		ASN:       cleanStoredValue(asnFromBundle(result.Bundle)),
+		Org:       cleanStoredValue(orgFromBundle(result.Bundle)),
+		CountryCode: countryCodeFromBundle(result.Bundle),
+		Country:     countryFromBundle(result.Bundle),
+		City:        cityFromBundle(result.Bundle),
+		Users:       []StoredUser{storedUser(user)},
+		Sources:     []string{source},
+	}
+	return server
+}
+
+func updateStoredServer(server *StoredServer, result SubscriptionResult, user User, source string, now time.Time) {
+	server.LastSeen = now
+	server.SeenCount++
+	server.Name = firstNonEmpty(cleanStoredValue(result.Proxy.Name), server.Name)
+	server.IP = firstNonEmpty(result.IP, server.IP)
+	server.ASN = firstNonEmpty(cleanStoredValue(asnFromBundle(result.Bundle)), server.ASN)
+	server.Org = firstNonEmpty(cleanStoredValue(orgFromBundle(result.Bundle)), server.Org)
+	server.CountryCode = firstNonEmpty(countryCodeFromBundle(result.Bundle), server.CountryCode)
+	server.Country = firstNonEmpty(countryFromBundle(result.Bundle), server.Country)
+	server.City = firstNonEmpty(cityFromBundle(result.Bundle), server.City)
+	server.Users = appendUniqueUser(server.Users, storedUser(user))
+	server.Sources = appendUniqueString(server.Sources, source)
+}
+
+func serverKey(proxy Proxy) string {
+	host := strings.ToLower(strings.TrimSpace(proxy.Host))
+	port := strings.TrimSpace(proxy.Port)
+	proto := strings.ToLower(strings.TrimSpace(proxy.Proto))
+	if host == "" || host == "N/A" || port == "" || port == "N/A" {
+		return ""
+	}
+	return proto + "|" + host + "|" + port
+}
+
+func storedUser(user User) StoredUser {
+	return StoredUser{
+		ID:        user.ID,
+		Username:  user.Username,
+		FirstName: user.FirstName,
+	}
+}
+
+func appendUniqueUser(users []StoredUser, user StoredUser) []StoredUser {
+	for i := range users {
+		if users[i].ID == user.ID {
+			users[i].Username = firstNonEmpty(user.Username, users[i].Username)
+			users[i].FirstName = firstNonEmpty(user.FirstName, users[i].FirstName)
+			return users
+		}
+	}
+	return append(users, user)
+}
+
+func appendUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func cleanStoredValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "N/A" {
+		return ""
+	}
+	return value
 }
 
 func loadDotEnv(path string) {
@@ -361,7 +632,22 @@ func getHWID() string {
 func NewTelegramClient(token string, timeout time.Duration) *TelegramClient {
 	return &TelegramClient{
 		base:  "https://api.telegram.org/bot" + token,
-		http:  newHTTPClient(timeout),
+		http:  newTelegramHTTPClient(timeout),
+	}
+}
+
+func newTelegramHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy:               http.ProxyFromEnvironment,
+			DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
+			ForceAttemptHTTP2:   false,
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
 	}
 }
 
@@ -377,7 +663,7 @@ func (t *TelegramClient) call(ctx context.Context, method string, payload any, o
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.http.Do(req)
 	if err != nil {
-		return err
+		return errors.New(redactTelegramToken(err.Error()))
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -454,12 +740,12 @@ func (t *TelegramClient) editMessage(ctx context.Context, chatID, messageID int6
 	return t.call(ctx, "editMessageText", payload, nil)
 }
 
-func poll(ctx context.Context, cfg Config, bot *TelegramClient, jobs chan<- Job) {
+func poll(ctx context.Context, app *App, jobs chan<- Job) {
 	var offset int64
 	for {
-		updates, err := bot.getUpdates(ctx, offset)
+		updates, err := app.bot.getUpdates(ctx, offset)
 		if err != nil {
-			log.Printf("getUpdates failed: %v", err)
+			logWarn("telegram getUpdates failed", "error", err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -468,12 +754,12 @@ func poll(ctx context.Context, cfg Config, bot *TelegramClient, jobs chan<- Job)
 			if update.Message == nil || strings.TrimSpace(update.Message.Text) == "" {
 				continue
 			}
-			handleUpdate(ctx, cfg, bot, jobs, *update.Message)
+			handleUpdate(ctx, app, jobs, *update.Message)
 		}
 	}
 }
 
-func handleUpdate(ctx context.Context, cfg Config, bot *TelegramClient, jobs chan<- Job, msg Message) {
+func handleUpdate(ctx context.Context, app *App, jobs chan<- Job, msg Message) {
 	text := strings.TrimSpace(msg.Text)
 	user := User{}
 	if msg.From != nil {
@@ -481,9 +767,9 @@ func handleUpdate(ctx context.Context, cfg Config, bot *TelegramClient, jobs cha
 	}
 
 	if strings.HasPrefix(text, "/start") || strings.HasPrefix(text, "/help") {
-		_, err := bot.sendMessage(ctx, msg.Chat.ID, startText(), msg.MessageID, nil)
+		_, err := app.bot.sendMessage(ctx, msg.Chat.ID, startText(), msg.MessageID, nil)
 		if err != nil {
-			log.Printf("send start failed: %v", err)
+			logWarn("send start failed", "user", user.ID, "chat", msg.Chat.ID, "error", err)
 		}
 		return
 	}
@@ -499,28 +785,33 @@ func handleUpdate(ctx context.Context, cfg Config, bot *TelegramClient, jobs cha
 		case jobs <- job:
 			queued++
 		default:
-			_, _ = bot.sendMessage(ctx, msg.Chat.ID, "⚠️ Очередь переполнена. Попробуйте еще раз чуть позже.", msg.MessageID, nil)
+			logWarn("queue full", "user", user.ID, "chat", msg.Chat.ID, "queue_size", app.cfg.QueueSize)
+			_, _ = app.bot.sendMessage(ctx, msg.Chat.ID, "⚠️ Очередь переполнена. Попробуйте еще раз чуть позже.", msg.MessageID, nil)
 			return
 		}
 	}
+	logInfo("message queued", "user", user.ID, "username", user.Username, "chat", msg.Chat.ID, "items", queued, "queue_depth", len(jobs))
 	if queued > 1 {
-		_, _ = bot.sendMessage(ctx, msg.Chat.ID, fmt.Sprintf("⏳ Принял строк: <b>%d</b>. Обработаю по очереди.", queued), msg.MessageID, nil)
+		_, _ = app.bot.sendMessage(ctx, msg.Chat.ID, fmt.Sprintf("⏳ Принял строк: <b>%d</b>. Обработаю по очереди.", queued), msg.MessageID, nil)
 	} else if len(jobs) > 1 {
-		_, _ = bot.sendMessage(ctx, msg.Chat.ID, fmt.Sprintf("⏳ Принял. Перед вами в очереди: <b>%d</b>.", len(jobs)-1), msg.MessageID, nil)
+		_, _ = app.bot.sendMessage(ctx, msg.Chat.ID, fmt.Sprintf("⏳ Принял. Перед вами в очереди: <b>%d</b>.", len(jobs)-1), msg.MessageID, nil)
 	}
 }
 
-func worker(ctx context.Context, cfg Config, bot *TelegramClient, jobs <-chan Job) {
+func worker(ctx context.Context, app *App, jobs <-chan Job) {
 	for job := range jobs {
 		name := job.User.Username
 		if name == "" {
 			name = job.User.FirstName
 		}
-		log.Printf("processing message from user=%d username=%q", job.User.ID, name)
-		if err := processJob(ctx, cfg, bot, job); err != nil {
-			log.Printf("job failed: %v", err)
-			_, _ = bot.sendMessage(ctx, job.Message.Chat.ID, "⚠️ Ошибка: "+escape(err.Error()), job.Message.MessageID, nil)
+		start := time.Now()
+		logInfo("job started", "user", job.User.ID, "username", name, "chat", job.Message.Chat.ID, "text", clampRunes(job.Text, 80))
+		if err := processJob(ctx, app, job); err != nil {
+			logError("job failed", "user", job.User.ID, "chat", job.Message.Chat.ID, "duration", time.Since(start), "error", err)
+			_, _ = app.bot.sendMessage(ctx, job.Message.Chat.ID, "⚠️ Ошибка: "+escape(err.Error()), job.Message.MessageID, nil)
+			continue
 		}
+		logInfo("job completed", "user", job.User.ID, "chat", job.Message.Chat.ID, "duration", time.Since(start))
 	}
 }
 
@@ -536,21 +827,21 @@ func splitBatchItems(text string) []string {
 	return items
 }
 
-func processJob(ctx context.Context, cfg Config, bot *TelegramClient, job Job) error {
+func processJob(ctx context.Context, app *App, job Job) error {
 	text := strings.TrimSpace(job.Text)
 	if match := proxyRe.FindString(text); match != "" {
-		return proxyAndReply(ctx, cfg, bot, job, match)
+		return proxyAndReply(ctx, app, job, match)
 	}
 	if match := httpURLRe.FindString(text); match != "" {
-		return subscriptionAndReply(ctx, cfg, bot, job, match)
+		return subscriptionAndReply(ctx, app, job, match)
 	}
 	if target, kind := extractTarget(text); target != "" {
 		if kind == "domain" {
-			return domainAndReply(ctx, cfg, bot, job, strings.ToLower(target))
+			return domainAndReply(ctx, app, job, strings.ToLower(target))
 		}
-		return ipAndReply(ctx, cfg, bot, job, target)
+		return ipAndReply(ctx, app, job, target)
 	}
-	_, err := bot.sendMessage(ctx, job.Message.Chat.ID, unknownText(), job.Message.MessageID, nil)
+	_, err := app.bot.sendMessage(ctx, job.Message.Chat.ID, unknownText(), job.Message.MessageID, nil)
 	return err
 }
 
@@ -580,68 +871,73 @@ func unknownText() string {
 	}, "\n")
 }
 
-func ipAndReply(ctx context.Context, cfg Config, bot *TelegramClient, job Job, ip string) error {
-	status, err := bot.sendMessage(ctx, job.Message.Chat.ID, "🔎 Ищу <code>"+escape(ip)+"</code>...", job.Message.MessageID, nil)
+func ipAndReply(ctx context.Context, app *App, job Job, ip string) error {
+	status, err := app.bot.sendMessage(ctx, job.Message.Chat.ID, "🔎 Ищу <code>"+escape(ip)+"</code>...", job.Message.MessageID, nil)
 	if err != nil {
 		return err
 	}
-	bundle := geoForIP(ctx, cfg, ip)
+	bundle := geoForIP(ctx, app.cfg, ip)
 	text := formatGeo(job.Text, bundle)
 	markup := makeKeyboard(ip, asnFromBundle(bundle))
-	if err := bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, text, markup); err != nil {
+	if err := app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, text, markup); err != nil {
 		return err
 	}
 	return nil
 }
 
-func domainAndReply(ctx context.Context, cfg Config, bot *TelegramClient, job Job, domain string) error {
-	status, err := bot.sendMessage(ctx, job.Message.Chat.ID, "🧭 Резолвлю <code>"+escape(domain)+"</code>...", job.Message.MessageID, nil)
+func domainAndReply(ctx context.Context, app *App, job Job, domain string) error {
+	status, err := app.bot.sendMessage(ctx, job.Message.Chat.ID, "🧭 Резолвлю <code>"+escape(domain)+"</code>...", job.Message.MessageID, nil)
 	if err != nil {
 		return err
 	}
-	ip, err := resolveDomain(ctx, domain, cfg.DNSCacheTTL)
+	ip, err := resolveDomain(ctx, domain, app.cfg.DNSCacheTTL)
 	if err != nil {
-		return bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ Не удалось резолвнуть домен: <code>"+escape(domain)+"</code>", nil)
+		return app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ Не удалось резолвнуть домен: <code>"+escape(domain)+"</code>", nil)
 	}
-	bundle := geoForIP(ctx, cfg, ip)
+	bundle := geoForIP(ctx, app.cfg, ip)
 	text := formatGeo(domain, bundle)
 	markup := makeKeyboard(ip, asnFromBundle(bundle))
-	if err := bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, text, markup); err != nil {
+	if err := app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, text, markup); err != nil {
 		return err
 	}
 	return nil
 }
 
-func proxyAndReply(ctx context.Context, cfg Config, bot *TelegramClient, job Job, uri string) error {
-	status, err := bot.sendMessage(ctx, job.Message.Chat.ID, "🧩 Анализирую ключ...", job.Message.MessageID, nil)
+func proxyAndReply(ctx context.Context, app *App, job Job, uri string) error {
+	status, err := app.bot.sendMessage(ctx, job.Message.Chat.ID, "🧩 Анализирую ключ...", job.Message.MessageID, nil)
 	if err != nil {
 		return err
 	}
 	proxy, err := parseProxyURI(uri)
 	if err != nil {
-		return bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ Не удалось разобрать ключ: "+escape(err.Error()), nil)
+		return app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ Не удалось разобрать ключ: "+escape(err.Error()), nil)
 	}
-	ip, err := resolveHostMaybe(ctx, proxy.Host, cfg.DNSCacheTTL)
+	ip, err := resolveHostMaybe(ctx, proxy.Host, app.cfg.DNSCacheTTL)
 	if err != nil {
 		ip = proxy.Host
 	}
-	bundle := geoForIP(ctx, cfg, ip)
+	bundle := geoForIP(ctx, app.cfg, ip)
+	if err := app.store.Upsert(proxy, ip, bundle, job.User, "proxy"); err != nil {
+		logWarn("server store write failed", "user", job.User.ID, "host", proxy.Host, "error", err)
+	} else {
+		logInfo("proxy parsed", "user", job.User.ID, "proto", proxy.Proto, "host", proxy.Host, "port", proxy.Port, "ip", ip)
+	}
 	text := formatProxy(proxy, bundle, "")
 	markup := makeKeyboard(ip, asnFromBundle(bundle))
-	if err := bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, text, markup); err != nil {
+	if err := app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, text, markup); err != nil {
 		return err
 	}
 	return nil
 }
 
-func subscriptionAndReply(ctx context.Context, cfg Config, bot *TelegramClient, job Job, subURL string) error {
-	status, err := bot.sendMessage(ctx, job.Message.Chat.ID, "📥 Загружаю подписку...", job.Message.MessageID, nil)
+func subscriptionAndReply(ctx context.Context, app *App, job Job, subURL string) error {
+	status, err := app.bot.sendMessage(ctx, job.Message.Chat.ID, "📥 Загружаю подписку...", job.Message.MessageID, nil)
 	if err != nil {
 		return err
 	}
-	lines, headers, err := fetchSubscriptionLines(ctx, cfg, subURL)
+	lines, headers, err := fetchSubscriptionLines(ctx, app.cfg, subURL)
 	if err != nil {
-		return bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ Ошибка загрузки подписки: "+escape(err.Error()), nil)
+		return app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ Ошибка загрузки подписки: "+escape(err.Error()), nil)
 	}
 
 	var proxies []Proxy
@@ -664,40 +960,45 @@ func subscriptionAndReply(ctx context.Context, cfg Config, bot *TelegramClient, 
 		for i := 0; i < min(len(errorEntries), 3); i++ {
 			names = append(names, errorEntries[i].Name)
 		}
-		return bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, strings.Join([]string{
+		return app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, strings.Join([]string{
 			"⚠️ Сервер отклонил запрос.",
 			"",
 			"Причина: " + escape(reason),
 			"Ответ: " + escape(strings.Join(names, ", ")),
 			"",
 			"HWID этого бота:",
-			"<code>" + escape(cfg.HWID) + "</code>",
+			"<code>" + escape(app.cfg.HWID) + "</code>",
 		}, "\n"), nil)
 	}
 
 	if len(proxies) == 0 {
-		return bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ В подписке не найдено поддерживаемых ключей.", nil)
+		return app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ В подписке не найдено поддерживаемых ключей.", nil)
 	}
 
 	total := len(proxies)
-	if err := bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, fmt.Sprintf("📦 Подписка: <b>%d</b> серверов\n🌍 Получаю геолокацию...", total), nil); err != nil {
-		log.Printf("status edit failed: %v", err)
+	if err := app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, fmt.Sprintf("📦 Подписка: <b>%d</b> серверов\n🌍 Получаю геолокацию...", total), nil); err != nil {
+		logWarn("subscription status edit failed", "user", job.User.ID, "error", err)
 	}
 
-	results := prepareSubscriptionResults(ctx, cfg, proxies)
+	results := prepareSubscriptionResults(ctx, app.cfg, proxies)
+	stored, err := app.store.UpsertMany(results, job.User, "subscription")
+	if err != nil {
+		logWarn("server store write failed", "user", job.User.ID, "error", err)
+	}
+	logInfo("subscription parsed", "user", job.User.ID, "servers", len(results), "stored", stored, "url", sanitizeURL(subURL))
 	for i, result := range results {
 		text := formatProxy(result.Proxy, result.Bundle, fmt.Sprintf("%d/%d", i+1, total))
-		_, sendErr := bot.sendMessage(ctx, job.Message.Chat.ID, text, job.Message.MessageID, makeKeyboard(result.IP, asnFromBundle(result.Bundle)))
+		_, sendErr := app.bot.sendMessage(ctx, job.Message.Chat.ID, text, job.Message.MessageID, makeKeyboard(result.IP, asnFromBundle(result.Bundle)))
 		if sendErr != nil {
-			log.Printf("subscription server %d/%d send failed: %v", i+1, total, sendErr)
-			_, _ = bot.sendMessage(ctx, job.Message.Chat.ID, fmt.Sprintf("%d/%d\n<code>%s:%s</code>\nОшибка: %s", i+1, total, escape(result.Proxy.Host), escape(result.Proxy.Port), escape(sendErr.Error())), job.Message.MessageID, nil)
+			logWarn("subscription server send failed", "user", job.User.ID, "index", i+1, "total", total, "error", sendErr)
+			_, _ = app.bot.sendMessage(ctx, job.Message.Chat.ID, fmt.Sprintf("%d/%d\n<code>%s:%s</code>\nОшибка: %s", i+1, total, escape(result.Proxy.Host), escape(result.Proxy.Port), escape(sendErr.Error())), job.Message.MessageID, nil)
 		}
 		if i+1 < total {
-			time.Sleep(cfg.SubMessageDelay)
+			time.Sleep(app.cfg.SubMessageDelay)
 		}
 	}
 
-	return bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, fmt.Sprintf("✅ Подписка: <b>%d</b> серверов\nГотово.", total), nil)
+	return app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, fmt.Sprintf("✅ Подписка: <b>%d</b> серверов\nГотово.", total), nil)
 }
 
 func prepareSubscriptionResults(ctx context.Context, cfg Config, proxies []Proxy) []SubscriptionResult {
@@ -1109,7 +1410,7 @@ func fetchSubscriptionLines(ctx context.Context, cfg Config, rawURL string) ([]s
 		}
 		lines, format := parseSubscriptionBody(lastRaw)
 		if len(lines) > 0 {
-			log.Printf("subscription parsed as %s with UA=%q: %d lines", format, ua, len(lines))
+			logInfo("subscription body parsed", "format", format, "user_agent", ua, "lines", len(lines))
 			return lines, lastHeaders, nil
 		}
 	}
@@ -1551,6 +1852,43 @@ func asnFromBundle(bundle GeoBundle) string {
 	return normalizeASN(bundle.MaxMind.Connection.ASN)
 }
 
+func orgFromBundle(bundle GeoBundle) string {
+	if bundle.MaxMind != nil && bundle.MaxMind.Success {
+		return firstNonEmpty(bundle.MaxMind.Connection.Org, bundle.MaxMind.Connection.ISP, bundle.MaxMind.Connection.Domain)
+	}
+	if bundle.IPInfo != nil {
+		return splitIPInfoOrg(bundle.IPInfo.Org)
+	}
+	return ""
+}
+
+func countryCodeFromBundle(bundle GeoBundle) string {
+	if bundle.MaxMind != nil && bundle.MaxMind.Success {
+		return bundle.MaxMind.CountryCode
+	}
+	if bundle.IPInfo != nil {
+		return bundle.IPInfo.Country
+	}
+	return ""
+}
+
+func countryFromBundle(bundle GeoBundle) string {
+	if bundle.MaxMind != nil && bundle.MaxMind.Success {
+		return bundle.MaxMind.Country
+	}
+	return ""
+}
+
+func cityFromBundle(bundle GeoBundle) string {
+	if bundle.MaxMind != nil && bundle.MaxMind.Success {
+		return bundle.MaxMind.City
+	}
+	if bundle.IPInfo != nil {
+		return bundle.IPInfo.City
+	}
+	return ""
+}
+
 func bundleFlag(bundle GeoBundle) string {
 	if bundle.MaxMind != nil && bundle.MaxMind.Flag.Emoji != "" {
 		return bundle.MaxMind.Flag.Emoji
@@ -1666,6 +2004,61 @@ func firstNonEmpty(values ...string) string {
 
 func escape(s string) string {
 	return html.EscapeString(s)
+}
+
+func redactTelegramToken(s string) string {
+	return tgTokenRe.ReplaceAllString(s, "bot<redacted>")
+}
+
+func sanitizeURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return redactTelegramToken(raw)
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	if parsed.User != nil {
+		parsed.User = url.User("<redacted>")
+	}
+	return redactTelegramToken(parsed.String())
+}
+
+func logInfo(message string, fields ...any) {
+	logEvent("INFO", message, fields...)
+}
+
+func logWarn(message string, fields ...any) {
+	logEvent("WARN", message, fields...)
+}
+
+func logError(message string, fields ...any) {
+	logEvent("ERROR", message, fields...)
+}
+
+func logEvent(level, message string, fields ...any) {
+	var b strings.Builder
+	b.WriteString("ts=")
+	b.WriteString(time.Now().UTC().Format(time.RFC3339))
+	b.WriteString(" level=")
+	b.WriteString(level)
+	b.WriteString(" msg=")
+	b.WriteString(logQuote(message))
+	for i := 0; i+1 < len(fields); i += 2 {
+		key := strings.TrimSpace(fmt.Sprint(fields[i]))
+		if key == "" {
+			continue
+		}
+		b.WriteByte(' ')
+		b.WriteString(key)
+		b.WriteByte('=')
+		b.WriteString(logQuote(fmt.Sprint(fields[i+1])))
+	}
+	log.Print(b.String())
+}
+
+func logQuote(value string) string {
+	value = redactTelegramToken(value)
+	return strconv.Quote(value)
 }
 
 func clampRunes(s string, max int) string {

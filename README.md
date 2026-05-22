@@ -49,6 +49,8 @@ https://search.censys.io/hosts/213.59.253.7
 - Добавлен Censys: всегда есть ссылка, а при наличии API-ключей бот дополнительно показывает найденные сервисы/порты.
 - Добавлены эмодзи для стран, статусов, разделов и inline-кнопок.
 - Добавлена обработка нескольких разных запросов в одном сообщении через Enter.
+- Добавлены структурные логи с уровнями `INFO/WARN/ERROR`.
+- Все proxy-серверы от пользователей сохраняются в компактный JSON без полного proxy URI.
 
 ## Настройка
 
@@ -79,12 +81,30 @@ GEO_CONCURRENCY=8
 SUB_MESSAGE_DELAY_MS=450
 DNS_CACHE_TTL_MINUTES=30
 GEO_CACHE_TTL_MINUTES=10
+
+SERVER_STORE_PATH=/data/servers.json
+SERVER_STORE_MAX=2000
 HWID=your_custom_hwid
 ```
 
 Если `CENSYS_API_ID` и `CENSYS_API_SECRET` не заданы, Censys всё равно будет добавлен как ссылка.
 
 `GEO_CONCURRENCY` управляет параллельными DNS/geo-запросами внутри одной подписки. Очередь пользователей при этом остаётся последовательной.
+
+`SERVER_STORE_PATH` указывает, куда сохранять распарсенные серверы. По умолчанию в Docker это `/data/servers.json`, а `docker-compose.yml` монтирует named volume `bot-data`, поэтому файл переживает пересборку контейнера. В JSON сохраняются метаданные серверов, пользователи и счётчики встречаемости; полный proxy-ключ не пишется.
+
+Пример логов:
+
+```text
+ts=2026-05-22T19:40:01Z level=INFO msg="job started" user="6264712024" username="guvchick" chat="6264712024"
+ts=2026-05-22T19:40:03Z level=INFO msg="subscription parsed" user="6264712024" servers="18" stored="18"
+```
+
+Посмотреть JSON внутри контейнера:
+
+```bash
+docker compose exec bot cat /data/servers.json
+```
 
 ## Запуск через Docker
 

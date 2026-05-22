@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /ipwho-tg-bo
 
 FROM alpine:3.20
 
-RUN adduser -D -H app
+RUN adduser -D -H app && mkdir -p /data && chown app:app /data
 WORKDIR /app
 
 COPY --from=builder /ipwho-tg-bot /usr/local/bin/ipwho-tg-bot
