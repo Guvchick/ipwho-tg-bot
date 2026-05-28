@@ -124,6 +124,14 @@ docker compose exec bot tail -n 200 /data/bot.log
 docker compose up -d --build
 ```
 
+После обновления кода лучше принудительно пересоздать контейнер, чтобы Docker не оставил старый процесс:
+
+```bash
+docker compose up -d --build --force-recreate
+```
+
+В свежей сборке startup-лог содержит `version="1.1.0"` и `log_path="/data/bot.log"`.
+
 Логи:
 
 ```bash

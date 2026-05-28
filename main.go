@@ -30,6 +30,7 @@ const (
 	ipinfoBaseURL   = "https://ipinfo.io"
 	censysHostURL   = "https://platform.censys.io/search?q="
 	telegramTimeout = 50 * time.Second
+	appVersion      = "1.1.0"
 )
 
 var (
@@ -274,6 +275,7 @@ func main() {
 	jobs := make(chan Job, cfg.QueueSize)
 
 	logInfo("bot starting",
+		"version", appVersion,
 		"hwid", cfg.HWID,
 		"queue", cfg.QueueSize,
 		"geo_concurrency", cfg.GeoConcurrency,
@@ -875,17 +877,21 @@ func splitBatchItems(text string) []string {
 func processJob(ctx context.Context, app *App, job Job) error {
 	text := strings.TrimSpace(job.Text)
 	if match := proxyRe.FindString(text); match != "" {
+		logInfo("job classified", "user", job.User.ID, "kind", "proxy", "proto", strings.ToLower(strings.SplitN(match, "://", 2)[0]))
 		return proxyAndReply(ctx, app, job, match)
 	}
 	if match := httpURLRe.FindString(text); match != "" {
+		logInfo("job classified", "user", job.User.ID, "kind", "subscription", "url", sanitizeURL(match))
 		return subscriptionAndReply(ctx, app, job, match)
 	}
 	if target, kind := extractTarget(text); target != "" {
+		logInfo("job classified", "user", job.User.ID, "kind", kind, "target", target)
 		if kind == "domain" {
 			return domainAndReply(ctx, app, job, strings.ToLower(target))
 		}
 		return ipAndReply(ctx, app, job, target)
 	}
+	logWarn("job classification failed", "user", job.User.ID, "text", clampRunes(text, 80))
 	_, err := app.bot.sendMessage(ctx, job.Message.Chat.ID, unknownText(), job.Message.MessageID, nil)
 	return err
 }
@@ -1005,6 +1011,7 @@ func subscriptionAndReply(ctx context.Context, app *App, job Job, subURL string)
 		"url", sanitizeURL(subURL),
 		"lines", len(lines),
 		"proxies", len(proxies),
+		"protocols", proxyProtocolCounts(proxies),
 		"error_entries", len(errorEntries),
 		"invalid", invalidLines,
 	)
@@ -1067,6 +1074,30 @@ func subscriptionAndReply(ctx context.Context, app *App, job Job, subURL string)
 	}
 
 	return app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, fmt.Sprintf("✅ Подписка: <b>%d</b> серверов\nГотово.", total), nil)
+}
+
+func proxyProtocolCounts(proxies []Proxy) string {
+	if len(proxies) == 0 {
+		return ""
+	}
+	counts := make(map[string]int)
+	protos := make([]string, 0, 4)
+	for _, proxy := range proxies {
+		proto := strings.ToLower(strings.TrimSpace(proxy.Proto))
+		if proto == "" {
+			proto = "unknown"
+		}
+		if counts[proto] == 0 {
+			protos = append(protos, proto)
+		}
+		counts[proto]++
+	}
+	sort.Strings(protos)
+	parts := make([]string, 0, len(protos))
+	for _, proto := range protos {
+		parts = append(parts, fmt.Sprintf("%s:%d", proto, counts[proto]))
+	}
+	return strings.Join(parts, ",")
 }
 
 func prepareSubscriptionResults(ctx context.Context, cfg Config, proxies []Proxy) []SubscriptionResult {
