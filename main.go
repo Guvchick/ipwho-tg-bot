@@ -45,9 +45,10 @@ var (
 	subscriptionUAChain = []string{
 		"Happ/1.0",
 		"v2RayTun/5.0",
+		"v2rayNG/1.9.31",
+		"NekoBoxForAndroid/1.3.8",
 		"ClashForAndroid/2.5.12",
 		"ClashMeta/1.18.0",
-		"ipwho-tg-bot-go/1.0",
 	}
 )
 
@@ -67,11 +68,12 @@ type Config struct {
 	TelegramAPITimeout time.Duration
 	ServerStorePath    string
 	ServerStoreMax     int
+	LogPath            string
 }
 
 type TelegramClient struct {
-	base  string
-	http  *http.Client
+	base string
+	http *http.Client
 }
 
 type Update struct {
@@ -236,7 +238,7 @@ type StoredServer struct {
 
 type ServerStoreFile struct {
 	UpdatedAt time.Time      `json:"updated_at"`
-	Count     int           `json:"count"`
+	Count     int            `json:"count"`
 	Servers   []StoredServer `json:"servers"`
 }
 
@@ -251,6 +253,12 @@ func main() {
 	log.SetFlags(0)
 	loadDotEnv(".env")
 	cfg := loadConfig()
+	logFile, err := setupLogging(cfg.LogPath)
+	if err != nil {
+		logWarn("file logging disabled", "path", cfg.LogPath, "error", err)
+	} else if logFile != nil {
+		defer logFile.Close()
+	}
 	if cfg.BotToken == "" {
 		logError("startup failed", "error", "BOT_TOKEN is not set")
 		os.Exit(1)
@@ -273,6 +281,7 @@ func main() {
 		"geo_cache", cfg.GeoCacheTTL,
 		"store_path", cfg.ServerStorePath,
 		"store_count", store.Count(),
+		"log_path", cfg.LogPath,
 	)
 	if cfg.IPWhoAccessKey == "" {
 		logWarn("ipwho access key is not set; free limits apply")
@@ -314,7 +323,26 @@ func loadConfig() Config {
 		TelegramAPITimeout: telegramTimeout,
 		ServerStorePath:    storePath,
 		ServerStoreMax:     storeMax,
+		LogPath:            firstNonEmpty(envValue("LOG_PATH"), "/data/bot.log"),
 	}
+}
+
+func setupLogging(path string) (*os.File, error) {
+	path = strings.TrimSpace(path)
+	if path == "" || strings.EqualFold(path, "stdout") {
+		return nil, nil
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, file))
+	return file, nil
 }
 
 func newHTTPClient(timeout time.Duration) *http.Client {
@@ -488,17 +516,17 @@ func (s *ServerStore) saveLocked() error {
 
 func newStoredServer(result SubscriptionResult, user User, source string, now time.Time) StoredServer {
 	server := StoredServer{
-		Key:       serverKey(result.Proxy),
-		FirstSeen: now,
-		LastSeen:  now,
-		SeenCount: 1,
-		Proto:     result.Proxy.Proto,
-		Name:      cleanStoredValue(result.Proxy.Name),
-		Host:      result.Proxy.Host,
-		Port:      result.Proxy.Port,
-		IP:        result.IP,
-		ASN:       cleanStoredValue(asnFromBundle(result.Bundle)),
-		Org:       cleanStoredValue(orgFromBundle(result.Bundle)),
+		Key:         serverKey(result.Proxy),
+		FirstSeen:   now,
+		LastSeen:    now,
+		SeenCount:   1,
+		Proto:       result.Proxy.Proto,
+		Name:        cleanStoredValue(result.Proxy.Name),
+		Host:        result.Proxy.Host,
+		Port:        result.Proxy.Port,
+		IP:          result.IP,
+		ASN:         cleanStoredValue(asnFromBundle(result.Bundle)),
+		Org:         cleanStoredValue(orgFromBundle(result.Bundle)),
 		CountryCode: countryCodeFromBundle(result.Bundle),
 		Country:     countryFromBundle(result.Bundle),
 		City:        cityFromBundle(result.Bundle),
@@ -648,8 +676,8 @@ func getHWID() string {
 
 func NewTelegramClient(token string, timeout time.Duration) *TelegramClient {
 	return &TelegramClient{
-		base:  "https://api.telegram.org/bot" + token,
-		http:  newTelegramHTTPClient(timeout),
+		base: "https://api.telegram.org/bot" + token,
+		http: newTelegramHTTPClient(timeout),
 	}
 }
 
@@ -959,9 +987,11 @@ func subscriptionAndReply(ctx context.Context, app *App, job Job, subURL string)
 
 	var proxies []Proxy
 	var errorEntries []Proxy
+	invalidLines := 0
 	for _, line := range lines {
 		proxy, err := parseProxyURI(line)
 		if err != nil {
+			invalidLines++
 			continue
 		}
 		if isErrorEntry(proxy) {
@@ -970,9 +1000,23 @@ func subscriptionAndReply(ctx context.Context, app *App, job Job, subURL string)
 		}
 		proxies = append(proxies, proxy)
 	}
+	logInfo("subscription lines classified",
+		"user", job.User.ID,
+		"url", sanitizeURL(subURL),
+		"lines", len(lines),
+		"proxies", len(proxies),
+		"error_entries", len(errorEntries),
+		"invalid", invalidLines,
+	)
 
 	if len(errorEntries) > 0 && len(proxies) == 0 {
 		reason := subscriptionRejectReason(headers)
+		logWarn("subscription rejected by server",
+			"user", job.User.ID,
+			"url", sanitizeURL(subURL),
+			"reason", reason,
+			"error_entries", len(errorEntries),
+		)
 		names := make([]string, 0, min(len(errorEntries), 3))
 		for i := 0; i < min(len(errorEntries), 3); i++ {
 			names = append(names, errorEntries[i].Name)
@@ -989,6 +1033,13 @@ func subscriptionAndReply(ctx context.Context, app *App, job Job, subURL string)
 	}
 
 	if len(proxies) == 0 {
+		logWarn("subscription has no supported proxies",
+			"user", job.User.ID,
+			"url", sanitizeURL(subURL),
+			"lines", len(lines),
+			"invalid", invalidLines,
+			"error_entries", len(errorEntries),
+		)
 		return app.bot.editMessage(ctx, job.Message.Chat.ID, status.MessageID, "⚠️ В подписке не найдено поддерживаемых ключей.", nil)
 	}
 
@@ -1029,7 +1080,10 @@ func prepareSubscriptionResults(ctx context.Context, cfg Config, proxies []Proxy
 	}
 	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
+	logInfo("subscription dns resolution started", "servers", len(proxies), "concurrency", limit)
 
+	var resolveFailures int
+	var resolveMu sync.Mutex
 	for i := range proxies {
 		wg.Add(1)
 		go func(i int) {
@@ -1040,6 +1094,10 @@ func prepareSubscriptionResults(ctx context.Context, cfg Config, proxies []Proxy
 			proxy := proxies[i]
 			ip, err := resolveHostMaybe(ctx, proxy.Host, cfg.DNSCacheTTL)
 			if err != nil {
+				resolveMu.Lock()
+				resolveFailures++
+				resolveMu.Unlock()
+				logWarn("subscription host resolve failed", "host", proxy.Host, "error", err)
 				ip = proxy.Host
 			}
 			results[i] = SubscriptionResult{
@@ -1049,6 +1107,7 @@ func prepareSubscriptionResults(ctx context.Context, cfg Config, proxies []Proxy
 		}(i)
 	}
 	wg.Wait()
+	logInfo("subscription dns resolution completed", "servers", len(results), "failures", resolveFailures)
 
 	uniqueIPs := make([]string, 0, len(results))
 	seen := make(map[string]bool, len(results))
@@ -1063,6 +1122,7 @@ func prepareSubscriptionResults(ctx context.Context, cfg Config, proxies []Proxy
 	bundles := make(map[string]GeoBundle, len(uniqueIPs))
 	var bundleMu sync.Mutex
 	sem = make(chan struct{}, limit)
+	logInfo("subscription geo lookup started", "unique_ips", len(uniqueIPs), "concurrency", limit)
 	for _, ip := range uniqueIPs {
 		wg.Add(1)
 		go func(ip string) {
@@ -1077,6 +1137,7 @@ func prepareSubscriptionResults(ctx context.Context, cfg Config, proxies []Proxy
 		}(ip)
 	}
 	wg.Wait()
+	logInfo("subscription geo lookup completed", "unique_ips", len(bundles))
 	for i := range results {
 		results[i].Bundle = bundles[results[i].IP]
 	}
@@ -1445,17 +1506,14 @@ func makeKeyboard(ip, asn string) *InlineKeyboardMarkup {
 }
 
 func fetchSubscriptionLines(ctx context.Context, cfg Config, rawURL string) ([]string, http.Header, error) {
-	baseHeaders := map[string]string{
-		"x-hwid":         cfg.HWID,
-		"x-device-os":    "Linux",
-		"x-ver-os":       "6.1",
-		"x-device-model": "Server",
-	}
+	baseHeaders := subscriptionBaseHeaders(cfg)
 	var lastHeaders http.Header
 	var lastRaw string
 	var lastErr error
+	safeURL := sanitizeURL(rawURL)
 
 	for _, ua := range subscriptionUAChain {
+		logInfo("subscription fetch attempt", "url", safeURL, "user_agent", ua, "device_model", baseHeaders["x-device-model"])
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return nil, nil, err
@@ -1467,19 +1525,30 @@ func fetchSubscriptionLines(ctx context.Context, cfg Config, rawURL string) ([]s
 
 		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
+			logWarn("subscription fetch request failed", "url", safeURL, "user_agent", ua, "error", err)
 			lastErr = err
 			continue
 		}
 		data, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
+			logWarn("subscription response read failed", "url", safeURL, "user_agent", ua, "status", resp.StatusCode, "error", readErr)
 			lastErr = readErr
 			continue
 		}
 		lastHeaders = resp.Header.Clone()
 		lastRaw = strings.TrimSpace(string(data))
+		logInfo("subscription response received",
+			"url", safeURL,
+			"user_agent", ua,
+			"status", resp.StatusCode,
+			"bytes", len(data),
+			"content_type", resp.Header.Get("content-type"),
+			"subscription_userinfo", resp.Header.Get("subscription-userinfo"),
+		)
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			logWarn("subscription response rejected", "url", safeURL, "user_agent", ua, "status", resp.StatusCode)
 			continue
 		}
 		lines, format := parseSubscriptionBody(lastRaw)
@@ -1487,17 +1556,30 @@ func fetchSubscriptionLines(ctx context.Context, cfg Config, rawURL string) ([]s
 			logInfo("subscription body parsed", "format", format, "user_agent", ua, "lines", len(lines))
 			return lines, lastHeaders, nil
 		}
+		logWarn("subscription body format not recognized", "url", safeURL, "user_agent", ua, "bytes", len(data), "content_type", resp.Header.Get("content-type"))
 	}
 	if lastRaw != "" {
 		lines := nonEmptyLines(lastRaw)
 		if len(lines) > 0 {
+			logWarn("subscription body returned as raw lines", "url", safeURL, "lines", len(lines))
 			return lines, lastHeaders, nil
 		}
 	}
 	if lastErr != nil {
+		logWarn("subscription fetch failed after all attempts", "url", safeURL, "error", lastErr)
 		return nil, lastHeaders, lastErr
 	}
+	logWarn("subscription fetch failed after all attempts", "url", safeURL, "error", "unknown subscription format")
 	return nil, lastHeaders, errors.New("unknown subscription format")
+}
+
+func subscriptionBaseHeaders(cfg Config) map[string]string {
+	return map[string]string{
+		"x-hwid":         cfg.HWID,
+		"x-device-os":    "Android",
+		"x-ver-os":       "14",
+		"x-device-model": "Pixel 8",
+	}
 }
 
 func parseSubscriptionBody(raw string) ([]string, string) {
@@ -1584,7 +1666,11 @@ func outboundsToURIs(data any) []string {
 			outbounds = []any{v}
 		}
 	case []any:
-		outbounds = v
+		var uris []string
+		for _, item := range v {
+			uris = append(uris, outboundsToURIs(item)...)
+		}
+		return uris
 	default:
 		return nil
 	}

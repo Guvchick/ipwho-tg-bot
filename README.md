@@ -87,6 +87,7 @@ GEO_CACHE_TTL_MINUTES=10
 
 SERVER_STORE_PATH=/data/servers.json
 SERVER_STORE_MAX=2000
+LOG_PATH=/data/bot.log
 HWID=your_custom_hwid
 ```
 
@@ -95,6 +96,8 @@ HWID=your_custom_hwid
 `GEO_CONCURRENCY` управляет параллельными DNS/geo-запросами внутри одной подписки. Очередь пользователей при этом остаётся последовательной.
 
 `SERVER_STORE_PATH` указывает, куда сохранять распарсенные серверы. По умолчанию в Docker это `/data/servers.json`, а `docker-compose.yml` монтирует named volume `bot-data`, поэтому файл переживает пересборку контейнера. В JSON сохраняются метаданные серверов, пользователи и счётчики встречаемости; полный proxy-ключ не пишется.
+
+`LOG_PATH` указывает файл для логов. По умолчанию бот сам создаёт `/data/bot.log` и пишет туда те же структурированные строки, которые видны в `docker logs`; директория создаётся автоматически.
 
 Пример логов:
 
@@ -107,6 +110,12 @@ ts=2026-05-22T19:40:03Z level=INFO msg="subscription parsed" user="6264712024" s
 
 ```bash
 docker compose exec bot cat /data/servers.json
+```
+
+Посмотреть файл логов:
+
+```bash
+docker compose exec bot tail -n 200 /data/bot.log
 ```
 
 ## Запуск через Docker
@@ -196,9 +205,9 @@ ipwho-tg-bot/
 
 ```text
 x-hwid: <machine-id>
-x-device-os: Linux
-x-ver-os: 6.1
-x-device-model: Server
+x-device-os: Android
+x-ver-os: 14
+x-device-model: Pixel 8
 ```
 
 HWID определяется так: `HWID` из окружения, затем `/etc/machine-id`, затем MAC-адрес.
@@ -208,7 +217,8 @@ User-Agent fallback:
 ```text
 Happ/1.0
 v2RayTun/5.0
+v2rayNG/1.9.31
+NekoBoxForAndroid/1.3.8
 ClashForAndroid/2.5.12
 ClashMeta/1.18.0
-ipwho-tg-bot-go/1.0
 ```
