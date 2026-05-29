@@ -1,232 +1,105 @@
-# ipwho-tg-bot
+# IPWho Robot
 
-Telegram-бот на Go для проверки IP, доменов, proxy-ключей и подписок.
+**[@ipwho_robot](https://t.me/ipwho_robot)** — Telegram-бот для быстрой разведки IP, доменов, proxy-ключей и VPN-подписок.
 
-Бот отвечает в аккуратном коротком формате:
+Отправьте IP, домен, строку с сервером, proxy URI или ссылку на подписку — бот разберёт ввод, найдёт серверы, покажет географию, ASN, провайдера, сетевые ссылки и transport-детали.
 
 ```text
-🇷🇺 www.gosuslugi.ru
+🇩🇪 Berlin Edge
+example.net:443
 
-213.59.253.7
+93.184.216.34
+
+🧬 Proxy
+protocol: vless
+transport: xhttp
+security: reality
+sni: front.example.net
+path: /xhttp
+mode: auto
+fp: chrome
 
 🌍 MaxMind
-🇷🇺 RU / Russia
-AS12389 / Rostelecom
+🇩🇪 DE / Germany
+AS15133 / Edgecast
 
 📍 IPinfo
-🇷🇺 RU / Russia / Moscow
-AS12389 / PJSC Rostelecom
-
-🔎 Censys
-https://platform.censys.io/search?q=213.59.253.7
+DE / Germany / Berlin
+AS15133 / Edgecast Inc.
 ```
 
-## Возможности
+## Что Умеет
 
-| Ввод | Что делает |
+- Проверяет IP-адреса и домены.
+- Достаёт IP из произвольных строк вроде `45.150.65.65:443` или `9/18 — 45.150.65.65:443`.
+- Парсит proxy-ключи и показывает сервер без раскрытия полного ключа в хранилище.
+- Загружает VPN-подписки и отправляет каждый сервер отдельной карточкой.
+- Показывает ASN, организацию, страну, город и полезные сетевые ссылки.
+- Добавляет кнопки для `bgp.he.net`, `bgp.tools`, `ipinfo.io`, Censys и whois.
+- Обрабатывает несколько строк в одном сообщении через очередь.
+
+## Поддерживаемый Ввод
+
+| Ввод | Результат |
 |---|---|
-| `8.8.8.8` | Геолокация IP |
-| `45.150.65.65:443` | Достаёт IP из строки с портом |
-| `9/18 — 45.150.65.65:443` | Достаёт IP из произвольного текста |
-| `example.com` | Резолвит домен и показывает IP-инфо |
-| `vless://...`, `vmess://...`, `trojan://...`, `ss://...`, `hysteria2://...`, `hy2://...`, `tuic://...` | Парсит ключ и проверяет сервер |
-| `https://...` | Загружает подписку и отправляет каждый сервер отдельным сообщением |
+| `8.8.8.8` | География, ASN, провайдер и ссылки |
+| `example.com` | DNS-резолв и IP-информация |
+| `45.150.65.65:443` | Проверка IP из строки с портом |
+| `vless://...` | Разбор proxy-сервера |
+| `vmess://...` | Разбор VMess-конфига |
+| `trojan://...` | Разбор Trojan-конфига |
+| `ss://...` | Разбор Shadowsocks |
+| `hysteria2://...`, `hy2://...` | Разбор Hysteria2 |
+| `tuic://...` | Разбор TUIC |
+| `https://...` | Загрузка и разбор подписки |
 
-Подписки поддерживаются в plain-text, base64, URL-safe base64, Xray JSON, sing-box-подобном JSON и newline-delimited JSON. Для `vless/vmess/trojan` бот вытаскивает transport-детали: `tcp`, `ws`, `grpc`, `xhttp`, `splithttp`, `httpupgrade`, `h2/http`, `kcp`, `quic`, `path`, `host/authority`, `mode`, `serviceName`, `ALPN`, TLS/Reality-поля.
+## Подписки
 
-Под каждым ответом есть кнопки с эмодзи: `🌐 bgp.he.net`, `🧭 bgp.tools`, `📍 ipinfo.io`, `🔎 Censys`, `📜 whois`, `🛰 AS...`.
+IPWho Robot понимает популярные форматы подписок:
 
-Можно отправить сразу несколько разных строк через Enter: IP, домены, ключи и ссылки будут поставлены в очередь и обработаны по порядку.
+- plain text
+- base64 и URL-safe base64
+- Xray JSON
+- sing-box-подобный JSON
+- newline-delimited JSON
 
-## Что исправлено
-
-- Бот полностью переписан на Go.
-- Ответы отправляются в Telegram HTML mode с экранированием пользовательских данных, поэтому ошибка `Can't parse entities...` больше не должна появляться из-за `_`, `[`, `(` и других символов в названиях серверов.
-- `Reserved range` больше не ломает обработку: бот показывает понятное примечание для частных/зарезервированных IP.
-- Строки вида `9/18 — 45.150.65.65:443` корректно распознаются.
-- Добавлена глобальная очередь: один worker обрабатывает запросы последовательно, а новые запросы ждут своей очереди.
-- Гео-запросы внутри одного задания выполняются параллельно, DNS и гео-ответы кешируются.
-- Добавлен Censys: всегда есть ссылка, а при наличии API-ключей бот дополнительно показывает найденные сервисы/порты.
-- Добавлены эмодзи для стран, статусов, разделов и inline-кнопок.
-- Добавлена обработка нескольких разных запросов в одном сообщении через Enter.
-- Добавлены структурные логи с уровнями `INFO/WARN/ERROR`.
-- Все proxy-серверы от пользователей сохраняются в компактный JSON без полного proxy URI.
-
-## Настройка
-
-Скопируйте пример окружения:
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Минимально нужен только токен Telegram:
-
-```env
-BOT_TOKEN=123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-Опциональные переменные:
-
-```env
-IPWHO_ACCESS_KEY=your_ipwho_access_key
-IPINFO_TOKEN=your_ipinfo_token
-
-CENSYS_PAT=your_censys_platform_personal_access_token
-
-# Legacy fallback:
-# CENSYS_API_ID=your_legacy_censys_api_id
-# CENSYS_API_SECRET=your_legacy_censys_api_secret
-
-QUEUE_SIZE=128
-GEO_CONCURRENCY=8
-SUB_MESSAGE_DELAY_MS=450
-DNS_CACHE_TTL_MINUTES=30
-GEO_CACHE_TTL_MINUTES=10
-
-SERVER_STORE_PATH=/data/servers.json
-SERVER_STORE_MAX=2000
-LOG_PATH=/data/bot.log
-HWID=your_custom_hwid
-```
-
-Если `CENSYS_PAT` не задан, Censys всё равно будет добавлен как ссылка на Platform. Старые `CENSYS_API_ID`/`CENSYS_API_SECRET` оставлены только как fallback для Legacy Search API.
-
-`GEO_CONCURRENCY` управляет параллельными DNS/geo-запросами внутри одной подписки. Очередь пользователей при этом остаётся последовательной.
-
-`SERVER_STORE_PATH` указывает, куда сохранять распарсенные серверы. По умолчанию в Docker это `/data/servers.json`, а `docker-compose.yml` монтирует named volume `bot-data`, поэтому файл переживает пересборку контейнера. В JSON сохраняются метаданные серверов, пользователи и счётчики встречаемости; полный proxy-ключ не пишется.
-
-`LOG_PATH` указывает файл для логов. По умолчанию бот сам создаёт `/data/bot.log` и пишет туда те же структурированные строки, которые видны в `docker logs`; директория создаётся автоматически.
-
-Пример логов:
+Для `vless`, `vmess` и `trojan` бот вытаскивает transport-детали:
 
 ```text
-ts=2026-05-22T19:40:01Z level=INFO msg="job started" user="6264712024" username="guvchick" chat="6264712024"
-ts=2026-05-22T19:40:03Z level=INFO msg="subscription parsed" user="6264712024" servers="18" stored="18"
+tcp, ws, grpc, xhttp, splithttp, httpupgrade, h2/http, kcp, quic
 ```
 
-Посмотреть JSON внутри контейнера:
+В карточке сервера видны `path`, `host/authority`, `mode`, `serviceName`, `ALPN`, `security`, `SNI`, `flow`, `fingerprint`, Reality `publicKey` и `shortId`.
 
-```bash
-docker compose exec bot cat /data/servers.json
-```
+## Для Кого
 
-Посмотреть файл логов:
+**Админам VPN и proxy-сервисов** — быстро проверить, что реально лежит в подписке.
 
-```bash
-docker compose exec bot tail -n 200 /data/bot.log
-```
+**Сетевым инженерам** — посмотреть ASN, провайдера и внешние сетевые источники за один запрос.
 
-## Запуск через Docker
+**Пользователям подписок** — понять, куда ведёт ключ и какие серверы внутри.
 
-```bash
-docker compose up -d --build
-```
+**Разработчикам ботов и панелей** — получить аккуратный пример обработки proxy URI и подписок на Go.
 
-После обновления кода лучше принудительно пересоздать контейнер, чтобы Docker не оставил старый процесс:
+## Аккуратность
 
-```bash
-docker compose up -d --build --force-recreate
-```
+- Полный proxy-ключ не сохраняется в JSON-хранилище.
+- Telegram-токены редактируются из логов.
+- Ответы экранируются для Telegram HTML mode.
+- Частные и зарезервированные IP не ломают ответ, а помечаются предупреждением.
+- Логи структурированные: `INFO`, `WARN`, `ERROR`.
 
-В свежей сборке startup-лог содержит `version="1.2.0"` и `log_path="/data/bot.log"`.
+## Под Капотом
 
-Логи:
+- Go
+- Telegram Bot API
+- ipwho.is
+- IPinfo
+- Censys Platform
+- Docker-ready runtime
 
-```bash
-docker compose logs -f
-```
+Для собственного запуска достаточно задать `BOT_TOKEN`; остальные интеграции и лимиты настраиваются через переменные окружения. Подробности можно посмотреть прямо в коде и `docker-compose.yml`.
 
-Управление:
+## Бот
 
-| Действие | Команда |
-|---|---|
-| Запустить | `docker compose up -d` |
-| Остановить | `docker compose down` |
-| Перезапустить | `docker compose restart` |
-| Логи | `docker compose logs -f` |
-| Статус | `docker compose ps` |
-
-## Запуск без Docker
-
-Нужен Go 1.22+.
-
-```bash
-go run .
-```
-
-Сборка бинарника:
-
-```bash
-go build -o ipwho-tg-bot .
-./ipwho-tg-bot
-```
-
-## systemd
-
-Пример сервиса:
-
-```ini
-[Unit]
-Description=IPWho Telegram Bot
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/ipwho-tg-bot
-EnvironmentFile=/home/ubuntu/ipwho-tg-bot/.env
-ExecStart=/home/ubuntu/ipwho-tg-bot/ipwho-tg-bot
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Команды:
-
-```bash
-go build -o ipwho-tg-bot .
-sudo systemctl daemon-reload
-sudo systemctl enable ipwho-bot
-sudo systemctl restart ipwho-bot
-sudo systemctl status ipwho-bot
-```
-
-## Структура
-
-```text
-ipwho-tg-bot/
-├── main.go
-├── go.mod
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-└── README.md
-```
-
-## HWID и подписки
-
-Для Remnawave/совместимых панелей бот передаёт:
-
-```text
-x-hwid: <machine-id>
-x-device-os: Android
-x-ver-os: 14
-x-device-model: Pixel 8
-```
-
-HWID определяется так: `HWID` из окружения, затем `/etc/machine-id`, затем MAC-адрес.
-
-User-Agent fallback:
-
-```text
-Happ/1.0
-v2RayTun/5.0
-v2rayNG/1.9.31
-NekoBoxForAndroid/1.3.8
-ClashForAndroid/2.5.12
-ClashMeta/1.18.0
-```
+Открыть в Telegram: **[@ipwho_robot](https://t.me/ipwho_robot)**
