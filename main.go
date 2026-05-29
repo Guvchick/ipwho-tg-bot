@@ -30,7 +30,7 @@ const (
 	ipinfoBaseURL   = "https://ipinfo.io"
 	censysHostURL   = "https://platform.censys.io/search?q="
 	telegramTimeout = 50 * time.Second
-	appVersion      = "1.1.0"
+	appVersion      = "1.2.0"
 )
 
 var (
@@ -38,7 +38,7 @@ var (
 	dnsCache      = newTTLCache[string]()
 	geoCache      = newTTLCache[GeoBundle]()
 	httpURLRe     = regexp.MustCompile(`(?i)https?://[^\s]+`)
-	proxyRe       = regexp.MustCompile(`(?i)(vless|vmess|trojan|ss)://[^\s]+`)
+	proxyRe       = regexp.MustCompile(`(?i)(vless|vmess|trojan|ss|hysteria2|hy2|tuic)://[^\s]+`)
 	ipv4Re        = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
 	domainRe      = regexp.MustCompile(`(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b`)
 	tgTokenRe     = regexp.MustCompile(`bot\d+:[A-Za-z0-9_-]+`)
@@ -190,6 +190,11 @@ type Proxy struct {
 	SNI         string
 	Network     string
 	Path        string
+	HostHeader  string
+	Mode        string
+	ServiceName string
+	ALPN        string
+	Method      string
 	Fingerprint string
 	Flow        string
 	PublicKey   string
@@ -1428,6 +1433,8 @@ func formatProxy(proxy Proxy, bundle GeoBundle, index string) string {
 		"<code>"+escape(bundle.IP)+"</code>",
 		"",
 	)
+	lines = append(lines, formatProxyDetails(proxy)...)
+	lines = append(lines, "")
 	lines = append(lines, formatMaxMind(bundle.MaxMind)...)
 	lines = append(lines, "")
 	lines = append(lines, formatIPInfo(bundle.IPInfo, bundle.MaxMind)...)
@@ -1437,6 +1444,43 @@ func formatProxy(proxy Proxy, bundle GeoBundle, index string) string {
 		lines = append(lines, "", "⚠️ Note", escape(warning))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func formatProxyDetails(proxy Proxy) []string {
+	lines := []string{"🧬 Proxy"}
+	add := func(label, value string) {
+		value = cleanDetailValue(value)
+		if value == "" {
+			return
+		}
+		lines = append(lines, escape(label)+": <code>"+escape(clampRunes(value, 96))+"</code>")
+	}
+	add("protocol", proxy.Proto)
+	add("transport", proxy.Network)
+	add("security", proxy.Security)
+	add("method", proxy.Method)
+	add("sni", proxy.SNI)
+	add("host", proxy.HostHeader)
+	add("path", proxy.Path)
+	add("mode", proxy.Mode)
+	add("service", proxy.ServiceName)
+	add("alpn", proxy.ALPN)
+	add("fp", proxy.Fingerprint)
+	add("flow", proxy.Flow)
+	add("pbk", proxy.PublicKey)
+	add("sid", proxy.ShortID)
+	if len(lines) == 1 {
+		return []string{"🧬 Proxy", "N/A"}
+	}
+	return lines
+}
+
+func cleanDetailValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "N/A" {
+		return ""
+	}
+	return value
 }
 
 func formatMaxMind(data *IPWhoResponse) []string {
@@ -1647,7 +1691,13 @@ func nonEmptyLines(raw string) []string {
 func containsProxyURI(lines []string) bool {
 	for _, line := range lines {
 		lo := strings.ToLower(line)
-		if strings.HasPrefix(lo, "vless://") || strings.HasPrefix(lo, "vmess://") || strings.HasPrefix(lo, "trojan://") || strings.HasPrefix(lo, "ss://") {
+		if strings.HasPrefix(lo, "vless://") ||
+			strings.HasPrefix(lo, "vmess://") ||
+			strings.HasPrefix(lo, "trojan://") ||
+			strings.HasPrefix(lo, "ss://") ||
+			strings.HasPrefix(lo, "hysteria2://") ||
+			strings.HasPrefix(lo, "hy2://") ||
+			strings.HasPrefix(lo, "tuic://") {
 			return true
 		}
 	}
@@ -1726,60 +1776,277 @@ func outboundToURI(ob map[string]any) string {
 	}
 	switch proto {
 	case "vless":
-		settings := mapAny(ob["settings"])
-		vnext := firstMapFromList(settings["vnext"])
-		user := firstMapFromList(vnext["users"])
-		stream := mapAny(ob["streamSettings"])
-		reality := mapAny(stream["realitySettings"])
-		tls := mapAny(stream["tlsSettings"])
-		address := strAny(vnext["address"])
-		port := intAny(vnext["port"])
-		uid := strAny(user["id"])
-		params := url.Values{}
-		setVal(params, "security", strAny(stream["security"]))
-		setVal(params, "type", strAny(stream["network"]))
-		setVal(params, "flow", strAny(user["flow"]))
-		setVal(params, "sni", firstNonEmpty(strAny(reality["serverName"]), strAny(tls["serverName"])))
-		setVal(params, "fp", strAny(reality["fingerprint"]))
-		setVal(params, "pbk", strAny(reality["publicKey"]))
-		setVal(params, "sid", strAny(reality["shortId"]))
-		return fmt.Sprintf("vless://%s@%s:%d?%s#%s", uid, address, port, params.Encode(), url.QueryEscape(tag))
+		return outboundVLESSToURI(ob, tag)
 	case "vmess":
-		settings := mapAny(ob["settings"])
-		vnext := firstMapFromList(settings["vnext"])
-		user := firstMapFromList(vnext["users"])
-		stream := mapAny(ob["streamSettings"])
-		tls := mapAny(stream["tlsSettings"])
-		ws := mapAny(stream["wsSettings"])
-		headers := mapAny(ws["headers"])
-		vmess := map[string]string{
-			"v":    "2",
-			"ps":   tag,
-			"add":  strAny(vnext["address"]),
-			"port": strconv.Itoa(intAny(vnext["port"])),
-			"id":   strAny(user["id"]),
-			"net":  strAny(stream["network"]),
-			"tls":  strAny(stream["security"]),
-			"sni":  strAny(tls["serverName"]),
-			"path": strAny(ws["path"]),
-			"host": strAny(headers["Host"]),
-			"type": "none",
-		}
-		data, _ := json.Marshal(vmess)
-		return "vmess://" + base64.StdEncoding.EncodeToString(data)
+		return outboundVMessToURI(ob, tag)
 	case "trojan":
-		settings := mapAny(ob["settings"])
-		server := firstMapFromList(settings["servers"])
-		stream := mapAny(ob["streamSettings"])
-		tls := mapAny(stream["tlsSettings"])
-		params := url.Values{}
-		setVal(params, "security", strAny(stream["security"]))
-		setVal(params, "type", strAny(stream["network"]))
-		setVal(params, "sni", strAny(tls["serverName"]))
-		return fmt.Sprintf("trojan://%s@%s:%d?%s#%s", strAny(server["password"]), strAny(server["address"]), intAny(server["port"]), params.Encode(), url.QueryEscape(tag))
+		return outboundTrojanToURI(ob, tag)
+	case "shadowsocks", "ss":
+		return outboundShadowSocksToURI(ob, tag)
+	case "hysteria2", "hy2":
+		return outboundHysteria2ToURI(ob, tag)
+	case "tuic":
+		return outboundTUICToURI(ob, tag)
 	default:
 		return ""
 	}
+}
+
+func outboundVLESSToURI(ob map[string]any, tag string) string {
+	settings := mapAny(ob["settings"])
+	vnext := firstMapFromList(settings["vnext"])
+	user := firstMapFromList(vnext["users"])
+	stream := mapAny(ob["streamSettings"])
+	transport := mapAny(ob["transport"])
+	tls := mapAny(ob["tls"])
+
+	address := firstNonEmpty(strAny(vnext["address"]), strAny(ob["server"]), strAny(ob["address"]))
+	port := firstPositiveInt(intAny(vnext["port"]), intAny(ob["server_port"]), intAny(ob["port"]))
+	uid := firstNonEmpty(strAny(user["id"]), strAny(ob["uuid"]), strAny(ob["id"]))
+	if address == "" || port <= 0 || uid == "" {
+		return ""
+	}
+
+	params := url.Values{}
+	addTLSParams(params, stream, tls)
+	addTransportParams(params, stream, transport)
+	setVal(params, "flow", firstNonEmpty(strAny(user["flow"]), strAny(ob["flow"])))
+	return fmt.Sprintf("vless://%s@%s?%s#%s", url.QueryEscape(uid), proxyHostPort(address, port), params.Encode(), url.QueryEscape(tag))
+}
+
+func outboundVMessToURI(ob map[string]any, tag string) string {
+	settings := mapAny(ob["settings"])
+	vnext := firstMapFromList(settings["vnext"])
+	user := firstMapFromList(vnext["users"])
+	stream := mapAny(ob["streamSettings"])
+	transport := mapAny(ob["transport"])
+	tls := mapAny(ob["tls"])
+
+	address := firstNonEmpty(strAny(vnext["address"]), strAny(ob["server"]), strAny(ob["address"]))
+	port := firstPositiveInt(intAny(vnext["port"]), intAny(ob["server_port"]), intAny(ob["port"]))
+	uid := firstNonEmpty(strAny(user["id"]), strAny(ob["uuid"]), strAny(ob["id"]))
+	if address == "" || port <= 0 || uid == "" {
+		return ""
+	}
+
+	params := url.Values{}
+	addTLSParams(params, stream, tls)
+	addTransportParams(params, stream, transport)
+	vmess := map[string]string{
+		"v":    "2",
+		"ps":   tag,
+		"add":  address,
+		"port": strconv.Itoa(port),
+		"id":   uid,
+		"aid":  firstNonEmpty(strAny(user["alterId"]), strAny(ob["alter_id"]), "0"),
+		"scy":  firstNonEmpty(strAny(user["security"]), strAny(ob["security"]), "auto"),
+		"net":  firstNonEmpty(params.Get("type"), "tcp"),
+		"tls":  params.Get("security"),
+		"sni":  params.Get("sni"),
+		"path": params.Get("path"),
+		"host": firstNonEmpty(params.Get("host"), params.Get("authority")),
+		"type": "none",
+	}
+	data, _ := json.Marshal(vmess)
+	return "vmess://" + base64.StdEncoding.EncodeToString(data)
+}
+
+func outboundTrojanToURI(ob map[string]any, tag string) string {
+	settings := mapAny(ob["settings"])
+	server := firstMapFromList(settings["servers"])
+	stream := mapAny(ob["streamSettings"])
+	transport := mapAny(ob["transport"])
+	tls := mapAny(ob["tls"])
+
+	address := firstNonEmpty(strAny(server["address"]), strAny(ob["server"]), strAny(ob["address"]))
+	port := firstPositiveInt(intAny(server["port"]), intAny(ob["server_port"]), intAny(ob["port"]))
+	password := firstNonEmpty(strAny(server["password"]), strAny(ob["password"]))
+	if address == "" || port <= 0 || password == "" {
+		return ""
+	}
+
+	params := url.Values{}
+	addTLSParams(params, stream, tls)
+	addTransportParams(params, stream, transport)
+	return fmt.Sprintf("trojan://%s@%s?%s#%s", url.QueryEscape(password), proxyHostPort(address, port), params.Encode(), url.QueryEscape(tag))
+}
+
+func outboundShadowSocksToURI(ob map[string]any, tag string) string {
+	settings := mapAny(ob["settings"])
+	server := firstMapFromList(settings["servers"])
+	address := firstNonEmpty(strAny(server["address"]), strAny(ob["server"]), strAny(ob["address"]))
+	port := firstPositiveInt(intAny(server["port"]), intAny(ob["server_port"]), intAny(ob["port"]))
+	method := firstNonEmpty(strAny(server["method"]), strAny(ob["method"]))
+	password := firstNonEmpty(strAny(server["password"]), strAny(ob["password"]))
+	if address == "" || port <= 0 || method == "" || password == "" {
+		return ""
+	}
+	u := url.URL{
+		Scheme:   "ss",
+		User:     url.UserPassword(method, password),
+		Host:     proxyHostPort(address, port),
+		Fragment: tag,
+	}
+	return u.String()
+}
+
+func outboundHysteria2ToURI(ob map[string]any, tag string) string {
+	tls := mapAny(ob["tls"])
+	address := firstNonEmpty(strAny(ob["server"]), strAny(ob["address"]))
+	port := firstPositiveInt(intAny(ob["server_port"]), intAny(ob["port"]))
+	password := strAny(ob["password"])
+	if address == "" || port <= 0 || password == "" {
+		return ""
+	}
+	params := url.Values{}
+	addTLSParams(params, nil, tls)
+	obfs := mapAny(ob["obfs"])
+	obfsType := strAny(obfs["type"])
+	if obfsType == "" {
+		if _, ok := ob["obfs"].(map[string]any); !ok {
+			obfsType = strAny(ob["obfs"])
+		}
+	}
+	setVal(params, "obfs", obfsType)
+	setVal(params, "obfs-password", firstNonEmpty(strAny(obfs["password"]), strAny(firstAny(ob["obfs_password"], ob["obfs-password"]))))
+	return fmt.Sprintf("hysteria2://%s@%s?%s#%s", url.QueryEscape(password), proxyHostPort(address, port), params.Encode(), url.QueryEscape(tag))
+}
+
+func outboundTUICToURI(ob map[string]any, tag string) string {
+	tls := mapAny(ob["tls"])
+	address := firstNonEmpty(strAny(ob["server"]), strAny(ob["address"]))
+	port := firstPositiveInt(intAny(ob["server_port"]), intAny(ob["port"]))
+	uid := strAny(ob["uuid"])
+	password := strAny(ob["password"])
+	if address == "" || port <= 0 || uid == "" {
+		return ""
+	}
+	params := url.Values{}
+	addTLSParams(params, nil, tls)
+	setVal(params, "congestion_control", strAny(ob["congestion_control"]))
+	setVal(params, "udp_relay_mode", strAny(ob["udp_relay_mode"]))
+	user := url.QueryEscape(uid)
+	if password != "" {
+		user += ":" + url.QueryEscape(password)
+	}
+	return fmt.Sprintf("tuic://%s@%s?%s#%s", user, proxyHostPort(address, port), params.Encode(), url.QueryEscape(tag))
+}
+
+func addTLSParams(params url.Values, stream, singTLS map[string]any) {
+	reality := mapAny(stream["realitySettings"])
+	tls := mapAny(stream["tlsSettings"])
+	singReality := mapAny(singTLS["reality"])
+	singUTLS := mapAny(singTLS["utls"])
+
+	security := strAny(stream["security"])
+	if security == "" && boolAny(singTLS["enabled"]) {
+		security = "tls"
+		if boolAny(singReality["enabled"]) || strAny(singReality["public_key"]) != "" {
+			security = "reality"
+		}
+	}
+	setVal(params, "security", security)
+	setVal(params, "sni", firstNonEmpty(
+		strAny(reality["serverName"]),
+		strAny(tls["serverName"]),
+		strAny(singTLS["server_name"]),
+		strAny(singReality["server_name"]),
+	))
+	setVal(params, "fp", firstNonEmpty(
+		strAny(reality["fingerprint"]),
+		strAny(tls["fingerprint"]),
+		strAny(singUTLS["fingerprint"]),
+	))
+	setVal(params, "pbk", firstNonEmpty(strAny(reality["publicKey"]), strAny(singReality["public_key"])))
+	setVal(params, "sid", firstNonEmpty(strAny(reality["shortId"]), strAny(singReality["short_id"])))
+	setVal(params, "alpn", firstNonEmpty(stringListAny(tls["alpn"]), stringListAny(singTLS["alpn"])))
+}
+
+func addTransportParams(params url.Values, stream, singTransport map[string]any) {
+	network := firstNonEmpty(strAny(stream["network"]), strAny(singTransport["type"]))
+	setVal(params, "type", network)
+
+	settings := xrayTransportSettings(stream, network)
+	headers := mapAny(firstAny(settings["headers"], singTransport["headers"]))
+	host := firstNonEmpty(
+		strAny(singTransport["host"]),
+		stringListAny(settings["host"]),
+		headerValue(headers, "Host"),
+		strAny(settings["authority"]),
+		strAny(singTransport["authority"]),
+	)
+	path := firstNonEmpty(strAny(settings["path"]), strAny(singTransport["path"]))
+	mode := firstNonEmpty(strAny(settings["mode"]), strAny(singTransport["mode"]))
+	serviceName := firstNonEmpty(strAny(settings["serviceName"]), strAny(singTransport["service_name"]), strAny(singTransport["serviceName"]))
+	authority := firstNonEmpty(strAny(settings["authority"]), strAny(singTransport["authority"]))
+
+	setVal(params, "host", host)
+	setVal(params, "path", path)
+	setVal(params, "mode", mode)
+	setVal(params, "serviceName", serviceName)
+	setVal(params, "authority", authority)
+}
+
+func xrayTransportSettings(stream map[string]any, network string) map[string]any {
+	switch strings.ToLower(network) {
+	case "ws", "websocket":
+		return mapAny(stream["wsSettings"])
+	case "grpc":
+		return mapAny(stream["grpcSettings"])
+	case "xhttp":
+		return firstMapAny(stream["xhttpSettings"], stream["splithttpSettings"])
+	case "splithttp", "split-http":
+		return firstMapAny(stream["splithttpSettings"], stream["xhttpSettings"])
+	case "httpupgrade":
+		return mapAny(stream["httpupgradeSettings"])
+	case "http", "h2":
+		return mapAny(stream["httpSettings"])
+	case "tcp":
+		return mapAny(stream["tcpSettings"])
+	case "kcp", "mkcp":
+		return mapAny(stream["kcpSettings"])
+	case "quic":
+		return mapAny(stream["quicSettings"])
+	default:
+		return firstMapAny(stream[network+"Settings"], stream[strings.ToLower(network)+"Settings"])
+	}
+}
+
+func headerValue(headers map[string]any, key string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, key) {
+			return strAny(v)
+		}
+	}
+	return ""
+}
+
+func stringListAny(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case []any:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			if val := strAny(item); val != "" {
+				parts = append(parts, val)
+			}
+		}
+		return strings.Join(parts, ",")
+	case []string:
+		return strings.Join(x, ",")
+	default:
+		return strAny(v)
+	}
+}
+
+func proxyHostPort(host string, port int) string {
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		return "[" + host + "]:" + strconv.Itoa(port)
+	}
+	return host + ":" + strconv.Itoa(port)
 }
 
 func parseProxyURI(raw string) (Proxy, error) {
@@ -1794,6 +2061,10 @@ func parseProxyURI(raw string) (Proxy, error) {
 		return parseTrojan(raw)
 	case strings.HasPrefix(lo, "ss://"):
 		return parseShadowSocks(raw)
+	case strings.HasPrefix(lo, "hysteria2://"), strings.HasPrefix(lo, "hy2://"):
+		return parseHysteria2(raw)
+	case strings.HasPrefix(lo, "tuic://"):
+		return parseTUIC(raw)
 	default:
 		return Proxy{}, errors.New("unsupported proxy protocol")
 	}
@@ -1811,14 +2082,18 @@ func parseVLESS(raw string) (Proxy, error) {
 		Host:        firstNonEmpty(u.Hostname(), "N/A"),
 		Port:        firstNonEmpty(u.Port(), "N/A"),
 		Name:        fragmentName(u),
-		Security:    firstNonEmpty(q.Get("security"), "N/A"),
-		SNI:         firstNonEmpty(q.Get("sni"), "N/A"),
-		Network:     firstNonEmpty(q.Get("type"), "N/A"),
-		Path:        firstNonEmpty(q.Get("path"), "N/A"),
-		Fingerprint: firstNonEmpty(q.Get("fp"), "N/A"),
-		Flow:        firstNonEmpty(q.Get("flow"), "N/A"),
-		PublicKey:   firstNonEmpty(q.Get("pbk"), "N/A"),
-		ShortID:     firstNonEmpty(q.Get("sid"), "N/A"),
+		Security:    firstNonEmpty(queryFirst(q, "security"), "N/A"),
+		SNI:         firstNonEmpty(queryFirst(q, "sni", "serverName"), "N/A"),
+		Network:     firstNonEmpty(queryFirst(q, "type", "net", "transport"), "N/A"),
+		Path:        firstNonEmpty(queryFirst(q, "path"), "N/A"),
+		HostHeader:  firstNonEmpty(queryFirst(q, "host", "authority"), "N/A"),
+		Mode:        firstNonEmpty(queryFirst(q, "mode"), "N/A"),
+		ServiceName: firstNonEmpty(queryFirst(q, "serviceName", "service_name"), "N/A"),
+		ALPN:        firstNonEmpty(queryFirst(q, "alpn"), "N/A"),
+		Fingerprint: firstNonEmpty(queryFirst(q, "fp", "fingerprint"), "N/A"),
+		Flow:        firstNonEmpty(queryFirst(q, "flow"), "N/A"),
+		PublicKey:   firstNonEmpty(queryFirst(q, "pbk", "publicKey"), "N/A"),
+		ShortID:     firstNonEmpty(queryFirst(q, "sid", "shortId"), "N/A"),
 	}, nil
 }
 
@@ -1834,14 +2109,18 @@ func parseTrojan(raw string) (Proxy, error) {
 		Host:        firstNonEmpty(u.Hostname(), "N/A"),
 		Port:        firstNonEmpty(u.Port(), "N/A"),
 		Name:        fragmentName(u),
-		Security:    firstNonEmpty(q.Get("security"), "N/A"),
-		SNI:         firstNonEmpty(q.Get("sni"), "N/A"),
-		Network:     firstNonEmpty(q.Get("type"), "N/A"),
-		Path:        firstNonEmpty(q.Get("path"), "N/A"),
-		Fingerprint: firstNonEmpty(q.Get("fp"), "N/A"),
+		Security:    firstNonEmpty(queryFirst(q, "security"), "N/A"),
+		SNI:         firstNonEmpty(queryFirst(q, "sni", "serverName"), "N/A"),
+		Network:     firstNonEmpty(queryFirst(q, "type", "net", "transport"), "N/A"),
+		Path:        firstNonEmpty(queryFirst(q, "path"), "N/A"),
+		HostHeader:  firstNonEmpty(queryFirst(q, "host", "authority"), "N/A"),
+		Mode:        firstNonEmpty(queryFirst(q, "mode"), "N/A"),
+		ServiceName: firstNonEmpty(queryFirst(q, "serviceName", "service_name"), "N/A"),
+		ALPN:        firstNonEmpty(queryFirst(q, "alpn"), "N/A"),
+		Fingerprint: firstNonEmpty(queryFirst(q, "fp", "fingerprint"), "N/A"),
 		Flow:        "N/A",
-		PublicKey:   "N/A",
-		ShortID:     "N/A",
+		PublicKey:   firstNonEmpty(queryFirst(q, "pbk", "publicKey"), "N/A"),
+		ShortID:     firstNonEmpty(queryFirst(q, "sid", "shortId"), "N/A"),
 	}, nil
 }
 
@@ -1865,6 +2144,11 @@ func parseVMess(raw string) (Proxy, error) {
 		SNI:         firstNonEmpty(strAny(obj["sni"]), "N/A"),
 		Network:     firstNonEmpty(strAny(obj["net"]), "N/A"),
 		Path:        firstNonEmpty(strAny(obj["path"]), "N/A"),
+		HostHeader:  firstNonEmpty(strAny(obj["host"]), "N/A"),
+		Mode:        firstNonEmpty(strAny(obj["mode"]), "N/A"),
+		ServiceName: firstNonEmpty(strAny(firstAny(obj["serviceName"], obj["service_name"])), "N/A"),
+		ALPN:        firstNonEmpty(strAny(obj["alpn"]), "N/A"),
+		Method:      firstNonEmpty(strAny(obj["scy"]), "N/A"),
 		Fingerprint: firstNonEmpty(strAny(obj["fp"]), "N/A"),
 		Flow:        "N/A",
 		PublicKey:   "N/A",
@@ -1875,6 +2159,7 @@ func parseVMess(raw string) (Proxy, error) {
 func parseShadowSocks(raw string) (Proxy, error) {
 	u, err := url.Parse(raw)
 	if err == nil && u.Hostname() != "" {
+		method := u.User.Username()
 		return Proxy{
 			Proto:    "ss",
 			UUID:     firstNonEmpty(u.User.String(), "N/A"),
@@ -1884,6 +2169,7 @@ func parseShadowSocks(raw string) (Proxy, error) {
 			Security: "N/A",
 			Network:  "tcp",
 			SNI:      "N/A",
+			Method:   firstNonEmpty(method, "N/A"),
 		}, nil
 	}
 	payload := raw[len("ss://"):]
@@ -1903,6 +2189,7 @@ func parseShadowSocks(raw string) (Proxy, error) {
 	if err != nil {
 		return Proxy{}, err
 	}
+	method := u.User.Username()
 	return Proxy{
 		Proto:    "ss",
 		UUID:     firstNonEmpty(u.User.String(), "N/A"),
@@ -1912,6 +2199,57 @@ func parseShadowSocks(raw string) (Proxy, error) {
 		Security: "N/A",
 		Network:  "tcp",
 		SNI:      "N/A",
+		Method:   firstNonEmpty(method, "N/A"),
+	}, nil
+}
+
+func parseHysteria2(raw string) (Proxy, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return Proxy{}, err
+	}
+	q := u.Query()
+	return Proxy{
+		Proto:       "hysteria2",
+		UUID:        firstNonEmpty(u.User.Username(), "N/A"),
+		Host:        firstNonEmpty(u.Hostname(), "N/A"),
+		Port:        firstNonEmpty(u.Port(), "N/A"),
+		Name:        fragmentName(u),
+		Security:    firstNonEmpty(queryFirst(q, "security"), "tls"),
+		SNI:         firstNonEmpty(queryFirst(q, "sni", "serverName"), "N/A"),
+		Network:     "udp",
+		HostHeader:  firstNonEmpty(queryFirst(q, "host"), "N/A"),
+		Mode:        firstNonEmpty(queryFirst(q, "obfs"), "N/A"),
+		ALPN:        firstNonEmpty(queryFirst(q, "alpn"), "N/A"),
+		Fingerprint: firstNonEmpty(queryFirst(q, "pinSHA256", "fingerprint", "fp"), "N/A"),
+		Flow:        "N/A",
+		PublicKey:   "N/A",
+		ShortID:     "N/A",
+	}, nil
+}
+
+func parseTUIC(raw string) (Proxy, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return Proxy{}, err
+	}
+	q := u.Query()
+	return Proxy{
+		Proto:       "tuic",
+		UUID:        firstNonEmpty(u.User.Username(), "N/A"),
+		Host:        firstNonEmpty(u.Hostname(), "N/A"),
+		Port:        firstNonEmpty(u.Port(), "N/A"),
+		Name:        fragmentName(u),
+		Security:    firstNonEmpty(queryFirst(q, "security"), "tls"),
+		SNI:         firstNonEmpty(queryFirst(q, "sni", "serverName"), "N/A"),
+		Network:     "udp",
+		HostHeader:  firstNonEmpty(queryFirst(q, "host"), "N/A"),
+		Mode:        firstNonEmpty(queryFirst(q, "congestion_control", "udp_relay_mode"), "N/A"),
+		ALPN:        firstNonEmpty(queryFirst(q, "alpn"), "N/A"),
+		Fingerprint: firstNonEmpty(queryFirst(q, "fingerprint", "fp"), "N/A"),
+		Flow:        "N/A",
+		PublicKey:   "N/A",
+		ShortID:     "N/A",
 	}, nil
 }
 
@@ -2314,9 +2652,30 @@ func intAny(v any) int {
 	}
 }
 
+func boolAny(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		b, _ := strconv.ParseBool(x)
+		return b
+	default:
+		return false
+	}
+}
+
 func mapAny(v any) map[string]any {
 	if m, ok := v.(map[string]any); ok {
 		return m
+	}
+	return map[string]any{}
+}
+
+func firstMapAny(values ...any) map[string]any {
+	for _, value := range values {
+		if m, ok := value.(map[string]any); ok && len(m) > 0 {
+			return m
+		}
 	}
 	return map[string]any{}
 }
@@ -2336,6 +2695,34 @@ func firstAny(values ...any) any {
 		}
 	}
 	return nil
+}
+
+func firstPositiveInt(values ...int) int {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func queryFirst(values url.Values, keys ...string) string {
+	for _, key := range keys {
+		if val := strings.TrimSpace(values.Get(key)); val != "" {
+			return val
+		}
+	}
+	for _, key := range keys {
+		for actual, vals := range values {
+			if !strings.EqualFold(actual, key) || len(vals) == 0 {
+				continue
+			}
+			if val := strings.TrimSpace(vals[0]); val != "" {
+				return val
+			}
+		}
+	}
+	return ""
 }
 
 func setVal(values url.Values, key, value string) {

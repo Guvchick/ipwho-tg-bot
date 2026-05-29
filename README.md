@@ -29,10 +29,10 @@ https://platform.censys.io/search?q=213.59.253.7
 | `45.150.65.65:443` | Достаёт IP из строки с портом |
 | `9/18 — 45.150.65.65:443` | Достаёт IP из произвольного текста |
 | `example.com` | Резолвит домен и показывает IP-инфо |
-| `vless://...`, `vmess://...`, `trojan://...`, `ss://...` | Парсит ключ и проверяет сервер |
+| `vless://...`, `vmess://...`, `trojan://...`, `ss://...`, `hysteria2://...`, `hy2://...`, `tuic://...` | Парсит ключ и проверяет сервер |
 | `https://...` | Загружает подписку и отправляет каждый сервер отдельным сообщением |
 
-Подписки поддерживаются в plain-text, base64, URL-safe base64, Xray JSON и newline-delimited JSON.
+Подписки поддерживаются в plain-text, base64, URL-safe base64, Xray JSON, sing-box-подобном JSON и newline-delimited JSON. Для `vless/vmess/trojan` бот вытаскивает transport-детали: `tcp`, `ws`, `grpc`, `xhttp`, `splithttp`, `httpupgrade`, `h2/http`, `kcp`, `quic`, `path`, `host/authority`, `mode`, `serviceName`, `ALPN`, TLS/Reality-поля.
 
 Под каждым ответом есть кнопки с эмодзи: `🌐 bgp.he.net`, `🧭 bgp.tools`, `📍 ipinfo.io`, `🔎 Censys`, `📜 whois`, `🛰 AS...`.
 
@@ -130,7 +130,7 @@ docker compose up -d --build
 docker compose up -d --build --force-recreate
 ```
 
-В свежей сборке startup-лог содержит `version="1.1.0"` и `log_path="/data/bot.log"`.
+В свежей сборке startup-лог содержит `version="1.2.0"` и `log_path="/data/bot.log"`.
 
 Логи:
 
